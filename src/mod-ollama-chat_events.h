@@ -10,7 +10,7 @@ class OllamaBotEventChatter
 public:
     void DispatchGameEvent(Player* source, std::string type, std::string detail);
     void QueueEvent(Player* bot, std::string type, std::string detail, std::string actorName, bool isGuildEvent = false);
-    std::string BuildPrompt(Player* bot, std::string promptTemplate, std::string eventType, std::string eventDetail, std::string actorName);
+    std::string BuildPrompt(Player* bot, std::string promptTemplate, std::string eventType, std::string eventDetail, std::string actorName, bool isGuildEvent = false);
 };
 
 class ChatOnKill : public PlayerScript

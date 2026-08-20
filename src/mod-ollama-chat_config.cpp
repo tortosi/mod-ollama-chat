@@ -51,11 +51,13 @@ uint32_t    g_OllamaNumThreads = 0;
 std::string g_OllamaStop = "";
 std::string g_OllamaSystemPrompt = "";
 std::string g_OllamaSeed = "";
+std::string g_OllamaKeepAlive = "";
 
 // --------------------------------------------
 // Concurrency/Queueing
 // --------------------------------------------
 uint32_t    g_MaxConcurrentQueries = 0;
+uint32_t    g_OllamaThreadPoolSize = 8;
 
 // --------------------------------------------
 // Feature Toggles & Core Settings
@@ -112,6 +114,19 @@ bool        g_EnableChatHistory = true;
 std::string g_ChatHistoryHeaderTemplate;
 std::string g_ChatHistoryLineTemplate;
 std::string g_ChatHistoryFooterTemplate;
+
+// --------------------------------------------
+// Shared Channel History Templates and Toggles
+// --------------------------------------------
+bool        g_EnableChannelHistory = true;
+uint32_t    g_MaxChannelHistory = 5;
+std::string g_ChannelHistoryHeaderTemplate;
+std::string g_ChannelHistoryLineTemplate;
+bool        g_EnableDuplicateReplyFilter = true;
+float       g_DuplicateReplySimilarityThreshold = 0.6f;
+uint32_t    g_HistoryInactivityMinutes = 60;
+
+bool        g_DisableNativePlayerbotChatReply = false;
 
 // --------------------------------------------
 // Chatbot Snapshot Template
@@ -302,7 +317,7 @@ void LoadBotPersonalityList()
     QueryResult tableExists = CharacterDatabase.Query("SELECT * FROM information_schema.tables WHERE table_schema = 'acore_characters' AND table_name = 'mod_ollama_chat_personality' LIMIT 1");
     if (!tableExists)
     {
-        LOG_ERROR("server.loading", "[Ollama Chat] Please source the required database table first");
+        LOG_ERROR("playerbots", "[Ollama Chat] Please source the required database table first");
         return;
     }
 
@@ -319,7 +334,7 @@ void LoadBotPersonalityList()
 
     if(g_DebugEnabled)
     {
-        LOG_INFO("server.loading", "[Ollama Chat] Fetching Bot Personality List into array");
+        LOG_INFO("playerbots", "[Ollama Chat] Fetching Bot Personality List into array");
     }
 
     do
@@ -395,8 +410,10 @@ void LoadOllamaChatConfig()
     g_OllamaStop                      = sConfigMgr->GetOption<std::string>("OllamaChat.Stop", "");
     g_OllamaSystemPrompt              = sConfigMgr->GetOption<std::string>("OllamaChat.SystemPrompt", "");
     g_OllamaSeed                      = sConfigMgr->GetOption<std::string>("OllamaChat.Seed", "");
+    g_OllamaKeepAlive                 = sConfigMgr->GetOption<std::string>("OllamaChat.KeepAlive", "");
 
     g_MaxConcurrentQueries            = sConfigMgr->GetOption<uint32_t>("OllamaChat.MaxConcurrentQueries", 0);
+    g_OllamaThreadPoolSize            = sConfigMgr->GetOption<uint32_t>("OllamaChat.ThreadPoolSize", 8);
 
     g_Enable                          = sConfigMgr->GetOption<bool>("OllamaChat.Enable", true);
     g_DisableRepliesInCombat          = sConfigMgr->GetOption<bool>("OllamaChat.DisableRepliesInCombat", true);
@@ -471,6 +488,16 @@ void LoadOllamaChatConfig()
     g_ChatHistoryHeaderTemplate       = sConfigMgr->GetOption<std::string>("OllamaChat.ChatHistoryHeaderTemplate", "");
     g_ChatHistoryLineTemplate         = sConfigMgr->GetOption<std::string>("OllamaChat.ChatHistoryLineTemplate", "");
     g_ChatHistoryFooterTemplate       = sConfigMgr->GetOption<std::string>("OllamaChat.ChatHistoryFooterTemplate", "");
+
+    g_EnableChannelHistory            = sConfigMgr->GetOption<bool>("OllamaChat.EnableChannelHistory", true);
+    g_MaxChannelHistory               = sConfigMgr->GetOption<uint32_t>("OllamaChat.MaxChannelHistory", 5);
+    g_ChannelHistoryHeaderTemplate    = sConfigMgr->GetOption<std::string>("OllamaChat.ChannelHistoryHeaderTemplate", "");
+    g_ChannelHistoryLineTemplate      = sConfigMgr->GetOption<std::string>("OllamaChat.ChannelHistoryLineTemplate", "");
+    g_EnableDuplicateReplyFilter      = sConfigMgr->GetOption<bool>("OllamaChat.EnableDuplicateReplyFilter", true);
+    g_DuplicateReplySimilarityThreshold = sConfigMgr->GetOption<float>("OllamaChat.DuplicateReplySimilarityThreshold", 0.6f);
+    g_HistoryInactivityMinutes        = sConfigMgr->GetOption<uint32_t>("OllamaChat.HistoryInactivityMinutes", 60);
+
+    g_DisableNativePlayerbotChatReply = sConfigMgr->GetOption<bool>("OllamaChat.DisableNativePlayerbotChatReply", false);
 
     g_EnableChatBotSnapshotTemplate   = sConfigMgr->GetOption<bool>("OllamaChat.EnableChatBotSnapshotTemplate", false);
     g_ChatBotSnapshotTemplate         = sConfigMgr->GetOption<std::string>("OllamaChat.ChatBotSnapshotTemplate", "");
@@ -631,7 +658,7 @@ void LoadOllamaChatConfig()
     g_DisableForGuild = sConfigMgr->GetOption<bool>("OllamaChat.DisableForGuild", false);
     g_DisableForParty = sConfigMgr->GetOption<bool>("OllamaChat.DisableForParty", false);
 
-    LOG_INFO("server.loading",
+    LOG_INFO("playerbots",
              "[Ollama Chat] Config loaded: Enabled = {}, SayDistance = {}, YellDistance = {}, "
              "Reply Chances - Say: P{}%/B{}%, Channel: P{}%/B{}%, Party: P{}%/B{}%, Guild: P{}%/B{}%, MaxBotsToPick = {}, "
              "Url = {}, Model = {}, MaxConcurrentQueries = {}, EnableRandomChatter = {}, MinRandInt = {}, MaxRandInt = {}, RandomChatterRealPlayerDistance = {}, "
@@ -656,7 +683,7 @@ void LoadPersonalityTemplatesFromDB()
     QueryResult result = CharacterDatabase.Query("SELECT `key`, `prompt`, `manual_only` FROM `mod_ollama_chat_personality_templates`");
     if (!result)
     {
-        LOG_ERROR("server.loading", "[Ollama Chat] No personality templates found in the database!");
+        LOG_ERROR("playerbots", "[Ollama Chat] No personality templates found in the database!");
         return;
     }
 
@@ -676,7 +703,7 @@ void LoadPersonalityTemplatesFromDB()
         }
     } while (result->NextRow());
 
-    LOG_INFO("server.loading", "[Ollama Chat] Cached {} personalities ({} available for random assignment).", 
+    LOG_INFO("playerbots", "[Ollama Chat] Cached {} personalities ({} available for random assignment).", 
              g_PersonalityKeys.size(), g_PersonalityKeysRandomOnly.size());
 }
 
@@ -726,11 +753,11 @@ void OllamaChatConfigWorldScript::OnStartup()
         }
         g_RAGSystem = new OllamaRAGSystem();
         if (!g_RAGSystem->Initialize()) {
-            LOG_ERROR("server.loading", "[Ollama Chat] Failed to initialize RAG system");
+            LOG_ERROR("playerbots", "[Ollama Chat] Failed to initialize RAG system");
             delete g_RAGSystem;
             g_RAGSystem = nullptr;
         } else {
-            LOG_INFO("server.loading", "[Ollama Chat] RAG system initialized successfully");
+            LOG_INFO("playerbots", "[Ollama Chat] RAG system initialized successfully");
         }
     }
 }
@@ -741,6 +768,6 @@ void OllamaChatConfigWorldScript::OnShutdown()
     if (g_RAGSystem) {
         delete g_RAGSystem;
         g_RAGSystem = nullptr;
-        LOG_INFO("server.loading", "[Ollama Chat] RAG system cleaned up");
+        LOG_INFO("playerbots", "[Ollama Chat] RAG system cleaned up");
     }
 }

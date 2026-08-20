@@ -10,6 +10,7 @@
 #include <mutex>
 #include <queue>
 #include <future>
+#include <chrono>
 
 std::string ExtractTextBetweenDoubleQuotes(const std::string& response)
 {
@@ -29,10 +30,10 @@ std::string QueryOllamaAPI(const std::string& prompt)
     
     if (!httpClient.IsAvailable())
     {
-        LOG_ERROR("server.loading", "[OllamaChat] ERROR: HTTP client not available. Check if Ollama service is running and accessible.");
+        LOG_ERROR("playerbots", "[OllamaChat] ERROR: HTTP client not available. Check if Ollama service is running and accessible.");
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[OllamaChat] Debug: HTTP client initialization failed.");
+            LOG_INFO("playerbots", "[OllamaChat] Debug: HTTP client initialization failed.");
         }
         return "";
     }
@@ -78,10 +79,10 @@ std::string QueryOllamaAPI(const std::string& prompt)
         options["num_thread"] = g_OllamaNumThreads;
         hasOptions = true;
         if(g_DebugEnabled) {
-            //LOG_INFO("server.loading", "[Ollama Chat] Setting num_thread to: {}", g_OllamaNumThreads);
+            //LOG_INFO("playerbots", "[Ollama Chat] Setting num_thread to: {}", g_OllamaNumThreads);
         }
     } else if(g_DebugEnabled) {
-        //LOG_INFO("server.loading", "[Ollama Chat] g_OllamaNumThreads is: {} (not sending num_thread)", g_OllamaNumThreads);
+        //LOG_INFO("playerbots", "[Ollama Chat] g_OllamaNumThreads is: {} (not sending num_thread)", g_OllamaNumThreads);
     }
     if (!g_OllamaSeed.empty()) {
         try {
@@ -90,7 +91,7 @@ std::string QueryOllamaAPI(const std::string& prompt)
             hasOptions = true;
         } catch (const std::exception& e) {
             if(g_DebugEnabled) {
-                LOG_INFO("server.loading", "[Ollama Chat] Invalid seed value: {}", g_OllamaSeed);
+                LOG_INFO("playerbots", "[Ollama Chat] Invalid seed value: {}", g_OllamaSeed);
             }
         }
     }
@@ -121,28 +122,45 @@ std::string QueryOllamaAPI(const std::string& prompt)
         // Sanitize system prompt as well
         requestData["system"] = SanitizeUTF8(g_OllamaSystemPrompt);
     }
+    if (!g_OllamaKeepAlive.empty())
+    {
+        // Keeps the model resident between the bursty, closely-spaced calls this module makes,
+        // instead of Ollama's default 5m idle unload forcing a reload on the next burst.
+        requestData["keep_alive"] = g_OllamaKeepAlive;
+    }
 
     if (g_ThinkModeEnableForModule)
     {
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] LLM set to Think mode.");
+            LOG_INFO("playerbots", "[Ollama Chat] LLM set to Think mode.");
         }
         requestData["think"] = true;
         requestData["hidethinking"] = true;
+    }
+    else
+    {
+        // Explicitly disable thinking rather than omitting the field: hybrid reasoning models
+        // (e.g. Qwen3) think by default on /api/generate when "think" isn't specified, which
+        // burns the whole NumPredict budget on the hidden <think> block and leaves "response"
+        // empty.
+        requestData["think"] = false;
     }
 
     std::string requestDataStr = requestData.dump();
 
     // Make HTTP POST request using our custom client
+    auto requestStart = std::chrono::steady_clock::now();
     std::string responseBuffer = httpClient.Post(url, requestDataStr);
+    auto requestMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - requestStart).count();
+    LOG_INFO("playerbots", "[OllamaChat] Respuesta de Ollama ({}) en {} ms", model, requestMs);
 
     if (responseBuffer.empty())
     {
-        LOG_ERROR("server.loading", "[OllamaChat] ERROR: Failed to reach Ollama API at {}. Check URL configuration and network connectivity.", url);
+        LOG_ERROR("playerbots", "[OllamaChat] ERROR: Failed to reach Ollama API at {}. Check URL configuration and network connectivity.", url);
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[OllamaChat] Debug: Empty response buffer from HTTP client. Model: {}", model);
+            LOG_INFO("playerbots", "[OllamaChat] Debug: Empty response buffer from HTTP client. Model: {}", model);
         }
         return "";
     }
@@ -168,10 +186,10 @@ std::string QueryOllamaAPI(const std::string& prompt)
     }
     catch (const std::exception& e)
     {
-        LOG_ERROR("server.loading", "[OllamaChat] ERROR: JSON parsing failed. Exception: {}", e.what());
+        LOG_ERROR("playerbots", "[OllamaChat] ERROR: JSON parsing failed. Exception: {}", e.what());
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[OllamaChat] Debug: Response buffer content: {}", responseBuffer);
+            LOG_INFO("playerbots", "[OllamaChat] Debug: Response buffer content: {}", responseBuffer);
         }
         return "";
     }
@@ -183,36 +201,36 @@ std::string QueryOllamaAPI(const std::string& prompt)
     // Check for unclosed think tags
     if (botReply.find("<think>") != std::string::npos || botReply.find("</think>") != std::string::npos)
     {
-        LOG_ERROR("server.loading", "[OllamaChat] ERROR: Unclosed <think> tags detected in response. This usually means the model's output was truncated.");
-        LOG_ERROR("server.loading", "[OllamaChat] SOLUTION: Set 'OllamaChat.ThinkModeEnableForModule = 1' in mod_ollama_chat.conf");
-        LOG_ERROR("server.loading", "[OllamaChat] SOLUTION: Set 'OllamaChat.NumPredict = 0' (unlimited tokens) in mod_ollama_chat.conf");
-        LOG_ERROR("server.loading", "[OllamaChat] SOLUTION: Set 'OllamaChat.NumCtx = 0' (model default context) in mod_ollama_chat.conf");
+        LOG_ERROR("playerbots", "[OllamaChat] ERROR: Unclosed <think> tags detected in response. This usually means the model's output was truncated.");
+        LOG_ERROR("playerbots", "[OllamaChat] SOLUTION: Set 'OllamaChat.ThinkModeEnableForModule = 1' in mod_ollama_chat.conf");
+        LOG_ERROR("playerbots", "[OllamaChat] SOLUTION: Set 'OllamaChat.NumPredict = 0' (unlimited tokens) in mod_ollama_chat.conf");
+        LOG_ERROR("playerbots", "[OllamaChat] SOLUTION: Set 'OllamaChat.NumCtx = 0' (model default context) in mod_ollama_chat.conf");
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[OllamaChat] Debug: Partial response with think tags: {}", botReply);
+            LOG_INFO("playerbots", "[OllamaChat] Debug: Partial response with think tags: {}", botReply);
         }
         return "";
     }
 
     if (botReply.empty())
     {
-        LOG_ERROR("server.loading", "[OllamaChat] ERROR: Empty response extracted from API. Model may not have generated any output.");
+        LOG_ERROR("playerbots", "[OllamaChat] ERROR: Empty response extracted from API. Model may not have generated any output.");
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[OllamaChat] Debug: Raw extracted response was empty.");
+            LOG_INFO("playerbots", "[OllamaChat] Debug: Raw extracted response was empty.");
         }
         return "";
     }
 
     if(g_DebugEnabled)
     {
-        LOG_INFO("server.loading", "[Ollama Chat] Parsed bot response: {}", botReply);
+        LOG_INFO("playerbots", "[Ollama Chat] Parsed bot response: {}", botReply);
 
         if (g_ThinkModeEnableForModule)
         {
             if(g_DebugEnabled)
             {
-                LOG_INFO("server.loading", "[Ollama Chat] Bot used think.");
+                LOG_INFO("playerbots", "[Ollama Chat] Bot used think.");
             }
         }
     }

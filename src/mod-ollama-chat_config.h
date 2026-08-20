@@ -52,11 +52,13 @@ extern uint32_t    g_OllamaNumThreads;
 extern std::string g_OllamaStop;
 extern std::string g_OllamaSystemPrompt;
 extern std::string g_OllamaSeed;
+extern std::string g_OllamaKeepAlive;
 
 // --------------------------------------------
 // Concurrency/Queueing
 // --------------------------------------------
 extern uint32_t    g_MaxConcurrentQueries;
+extern uint32_t    g_OllamaThreadPoolSize;
 
 // --------------------------------------------
 // Feature Toggles & Core Settings
@@ -108,6 +110,25 @@ extern bool        g_EnableChatHistory;
 extern std::string g_ChatHistoryHeaderTemplate;
 extern std::string g_ChatHistoryLineTemplate;
 extern std::string g_ChatHistoryFooterTemplate;
+
+// --------------------------------------------
+// Shared Channel History Templates and Toggles
+// --------------------------------------------
+extern bool        g_EnableChannelHistory;
+extern uint32_t    g_MaxChannelHistory;
+extern std::string g_ChannelHistoryHeaderTemplate;
+extern std::string g_ChannelHistoryLineTemplate;
+extern bool        g_EnableDuplicateReplyFilter;
+extern float       g_DuplicateReplySimilarityThreshold;
+extern uint32_t    g_HistoryInactivityMinutes;
+
+// --------------------------------------------
+// mod-playerbots Interop
+// --------------------------------------------
+// Forces AiPlayerbot.RandomBotTalk off from within mod-ollama-chat (see random.cpp OnUpdate)
+// instead of patching mod-playerbots itself, since mod-playerbots is upstream and updated
+// weekly while this module is the one we maintain and re-apply patches from.
+extern bool        g_DisableNativePlayerbotChatReply;
 
 // --------------------------------------------
 // Chatbot Snapshot Template

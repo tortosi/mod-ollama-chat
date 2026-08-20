@@ -43,7 +43,7 @@ void SetBotPlayerSentiment(uint64_t botGuid, uint64_t playerGuid, float sentimen
     
     if (g_DebugEnabled)
     {
-        LOG_INFO("server.loading", "[OllamaChat] Set sentiment between bot {} and player {} to {:.2f}", 
+        LOG_INFO("playerbots", "[OllamaChat] Set sentiment between bot {} and player {} to {:.2f}", 
                  botGuid, playerGuid, sentimentValue);
     }
 }
@@ -58,7 +58,7 @@ float AnalyzeMessageSentiment(const std::string& message)
     
     if (g_DebugEnabled)
     {
-        LOG_INFO("server.loading", "[OllamaChat] Sentiment analysis prompt: {}", prompt);
+        LOG_INFO("playerbots", "[OllamaChat] Sentiment analysis prompt: {}", prompt);
     }
     
     // Query the LLM for sentiment analysis
@@ -67,7 +67,7 @@ float AnalyzeMessageSentiment(const std::string& message)
     if (response.empty())
     {
         if (g_DebugEnabled)
-            LOG_INFO("server.loading", "[OllamaChat] Empty sentiment analysis response");
+            LOG_INFO("playerbots", "[OllamaChat] Empty sentiment analysis response");
         return 0.0f;
     }
     
@@ -89,7 +89,7 @@ float AnalyzeMessageSentiment(const std::string& message)
     
     if (g_DebugEnabled)
     {
-        LOG_INFO("server.loading", "[OllamaChat] Sentiment analysis: '{}' -> adjustment: {:.2f}", 
+        LOG_INFO("playerbots", "[OllamaChat] Sentiment analysis: '{}' -> adjustment: {:.2f}", 
                  response, adjustment);
     }
     
@@ -118,7 +118,7 @@ void UpdateBotPlayerSentiment(Player* bot, Player* player, const std::string& me
     
     if (g_DebugEnabled && adjustment != 0.0f)
     {
-        LOG_INFO("server.loading", "[OllamaChat] Updated sentiment: {} -> {} ({:+.2f}) for bot {} and player {}", 
+        LOG_INFO("playerbots", "[OllamaChat] Updated sentiment: {} -> {} ({:+.2f}) for bot {} and player {}", 
                  currentSentiment, newSentiment, adjustment, bot->GetName(), player->GetName());
     }
 }
@@ -152,7 +152,7 @@ void LoadBotPlayerSentimentsFromDB()
     
     if (!result)
     {
-        LOG_INFO("server.loading", "[OllamaChat] No existing sentiment data found in database");
+        LOG_INFO("playerbots", "[OllamaChat] No existing sentiment data found in database");
         return;
     }
     
@@ -169,7 +169,7 @@ void LoadBotPlayerSentimentsFromDB()
         
     } while (result->NextRow());
     
-    LOG_INFO("server.loading", "[OllamaChat] Loaded {} sentiment records from database", count);
+    LOG_INFO("playerbots", "[OllamaChat] Loaded {} sentiment records from database", count);
 }
 
 void SaveBotPlayerSentimentsToDB()
@@ -196,7 +196,7 @@ void SaveBotPlayerSentimentsToDB()
     
     if (g_DebugEnabled)
     {
-        LOG_INFO("server.loading", "[OllamaChat] Saved sentiment data to database");
+        LOG_INFO("playerbots", "[OllamaChat] Saved sentiment data to database");
     }
 }
 
@@ -204,11 +204,11 @@ void InitializeSentimentTracking()
 {
     if (!g_EnableSentimentTracking)
     {
-        LOG_INFO("server.loading", "[OllamaChat] Sentiment tracking is disabled");
+        LOG_INFO("playerbots", "[OllamaChat] Sentiment tracking is disabled");
         return;
     }
     
-    LOG_INFO("server.loading", "[OllamaChat] Initializing sentiment tracking system...");
+    LOG_INFO("playerbots", "[OllamaChat] Initializing sentiment tracking system...");
     
     // Load existing sentiment data from database
     LoadBotPlayerSentimentsFromDB();
@@ -216,5 +216,5 @@ void InitializeSentimentTracking()
     // Initialize the last save time
     g_LastSentimentSaveTime = time(nullptr);
     
-    LOG_INFO("server.loading", "[OllamaChat] Sentiment tracking system initialized");
+    LOG_INFO("playerbots", "[OllamaChat] Sentiment tracking system initialized");
 }

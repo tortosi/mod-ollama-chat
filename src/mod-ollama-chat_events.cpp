@@ -1,10 +1,13 @@
 #include "mod-ollama-chat_events.h"
 #include "mod-ollama-chat_config.h"
+#include "mod-ollama-chat_handler.h"
 #include "mod-ollama-chat_random.h"
 #include "mod-ollama-chat_api.h"
+#include "mod-ollama-chat_threadpool.h"
 #include "mod-ollama-chat-utilities.h"
 #include "mod-ollama-chat_personality.h"
 #include "mod-ollama-chat_sentiment.h"
+#include "mod-ollama-chat_rag.h"
 #include "Player.h"
 #include "ObjectAccessor.h"
 #include "Guild.h"
@@ -89,13 +92,13 @@ void OllamaBotEventChatter::DispatchGameEvent(Player* source, std::string type, 
     {
         if (g_DebugEnabled)
         {
-            //LOG_INFO("server.loading", "[OllamaChat] Skipping bot source {} - no real players nearby", source->GetName());
+            //LOG_INFO("playerbots", "[OllamaChat] Skipping bot source {} - no real players nearby", source->GetName());
         }
         return;
     }
 
     if (g_DebugEnabled)
-        LOG_INFO("server.loading", "[OllamaChat] DispatchGameEvent from {} | type={} | detail={}", source->GetName(), type, detail);
+        LOG_INFO("playerbots", "[OllamaChat] DispatchGameEvent from {} | type={} | detail={}", source->GetName(), type, detail);
 
     float maxDist = g_EventChatterRealPlayerDistance;
     bool disableInCombat = g_DisableRepliesInCombat;
@@ -150,7 +153,7 @@ void OllamaBotEventChatter::DispatchGameEvent(Player* source, std::string type, 
             if (player->IsWithinDist(source, maxDist, false)) {
                 candidateBots.push_back(player);
                 if (g_DebugEnabled)
-                    LOG_INFO("server.loading", "[OllamaChat] Nearby player {} within {:.1f} yards", player->GetName(), maxDist);
+                    LOG_INFO("playerbots", "[OllamaChat] Nearby player {} within {:.1f} yards", player->GetName(), maxDist);
             }
         }
     }
@@ -238,13 +241,13 @@ void OllamaBotEventChatter::DispatchGameEvent(Player* source, std::string type, 
         PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
         if (!ai) {
             if (g_DebugEnabled)
-                LOG_INFO("server.loading", "[OllamaChat] Skipping {} - not a bot", bot->GetName());
+                LOG_INFO("playerbots", "[OllamaChat] Skipping {} - not a bot", bot->GetName());
             continue;
         }
 
         if (disableInCombat && bot->IsInCombat()) {
             if (g_DebugEnabled)
-                LOG_INFO("server.loading", "[OllamaChat] Skipping {} - in combat", bot->GetName());
+                LOG_INFO("playerbots", "[OllamaChat] Skipping {} - in combat", bot->GetName());
             continue;
         }
 
@@ -264,12 +267,12 @@ void OllamaBotEventChatter::DispatchGameEvent(Player* source, std::string type, 
 
         if (urand(1, 100) > chance) {
             if (g_DebugEnabled)
-                LOG_INFO("server.loading", "[OllamaChat] Skipping {} - failed chance roll", bot->GetName());
+                LOG_INFO("playerbots", "[OllamaChat] Skipping {} - failed chance roll", bot->GetName());
             continue;
         }
 
         if (g_DebugEnabled)
-            LOG_INFO("server.loading", "[OllamaChat] Queueing event for bot {}", bot->GetName());
+            LOG_INFO("playerbots", "[OllamaChat] Queueing event for bot {}", bot->GetName());
 
         QueueEvent(bot, type, detail, source->GetName(), isGuildEvent);
 
@@ -280,7 +283,7 @@ void OllamaBotEventChatter::DispatchGameEvent(Player* source, std::string type, 
     }
 
     if (g_DebugEnabled)
-        LOG_INFO("server.loading", "[OllamaChat] Dispatch complete. {} bots responded", responses);
+        LOG_INFO("playerbots", "[OllamaChat] Dispatch complete. {} bots responded", responses);
 }
 
 
@@ -291,22 +294,38 @@ void OllamaBotEventChatter::QueueEvent(Player* bot, std::string type, std::strin
 
     uint64_t botGuid = bot->GetGUID().GetRawValue();
 
-    std::thread([this, botGuid, type, detail, actorName, isGuildEvent]()
+    EnqueueOllamaChatTask([this, botGuid, type, detail, actorName, isGuildEvent]()
     {
         try
         {
             Player* botPtr = ObjectAccessor::FindPlayer(ObjectGuid(botGuid));
             if (!botPtr) return;
 
-            std::string prompt = BuildPrompt(botPtr, g_EventChatterPromptTemplate, type, detail, actorName);
+            std::string prompt = BuildPrompt(botPtr, g_EventChatterPromptTemplate, type, detail, actorName, isGuildEvent);
             if (prompt.empty()) return;
 
-            std::string response = QueryOllamaAPI(prompt);
+            // Going through QueryManager so this respects OllamaChat.MaxConcurrentQueries like
+            // every other call path.
+            auto responseFuture = SubmitQuery(prompt);
+            if (!responseFuture.valid()) return;
+            std::string response = responseFuture.get();
             if (response.empty())
             {
                 if (g_DebugEnabled)
-                    LOG_INFO("server.loading", "[OllamaChat] Bot {} skipped event response due to API error", botPtr->GetName());
+                    LOG_INFO("playerbots", "[OllamaChat] Bot {} skipped event response due to API error", botPtr->GetName());
                 return;
+            }
+
+            {
+                ChatChannelSourceLocal historySource = (isGuildEvent && botPtr->GetGuild())
+                    ? SRC_GUILD_LOCAL
+                    : (botPtr->GetGroup() ? SRC_PARTY_LOCAL : SRC_GENERAL_LOCAL);
+                if (IsTooSimilarToChannelHistory(GetChannelHistoryKey(historySource, botPtr), response))
+                {
+                    if (g_DebugEnabled)
+                        LOG_INFO("playerbots", "[OllamaChat] Bot {} skipped event response, too similar to recent channel history: {}", botPtr->GetName(), response);
+                    return;
+                }
             }
 
             // reacquire pointers before use
@@ -320,7 +339,7 @@ void OllamaBotEventChatter::QueueEvent(Player* bot, std::string type, std::strin
             {
                 uint32_t delay = g_TypingSimulationBaseDelay + (response.length() * g_TypingSimulationDelayPerChar);
                 if (g_DebugEnabled)
-                    LOG_INFO("server.loading", "[OllamaChat] Bot {} simulating typing delay: {}ms for {} characters", 
+                    LOG_INFO("playerbots", "[OllamaChat] Bot {} simulating typing delay: {}ms for {} characters", 
                              botPtr->GetName(), delay, response.length());
                 std::this_thread::sleep_for(std::chrono::milliseconds(delay));
                 
@@ -338,11 +357,12 @@ void OllamaBotEventChatter::QueueEvent(Player* bot, std::string type, std::strin
                 if (g_DisableForGuild)
                 {
                     if (g_DebugEnabled)
-                        LOG_INFO("server.loading", "[Ollama Chat] Guild event chatter skipped (guild channels disabled)");
+                        LOG_INFO("playerbots", "[Ollama Chat] Guild event chatter skipped (guild channels disabled)");
                     return;
                 }
                 
                 botAI->SayToGuild(response);
+                AppendChannelHistory(GetChannelHistoryKey(SRC_GUILD_LOCAL, botPtr), botPtr->GetName(), response);
             }
             else if (botPtr->GetGroup())
             {
@@ -350,11 +370,12 @@ void OllamaBotEventChatter::QueueEvent(Player* bot, std::string type, std::strin
                 if (g_DisableForParty)
                 {
                     if (g_DebugEnabled)
-                        LOG_INFO("server.loading", "[Ollama Chat] Party event chatter skipped (party channels disabled)");
+                        LOG_INFO("playerbots", "[Ollama Chat] Party event chatter skipped (party channels disabled)");
                     return;
                 }
-                
+
                 botAI->SayToParty(response);
+                AppendChannelHistory(GetChannelHistoryKey(SRC_PARTY_LOCAL, botPtr), botPtr->GetName(), response);
             }
             else
             {
@@ -377,7 +398,7 @@ void OllamaBotEventChatter::QueueEvent(Player* bot, std::string type, std::strin
                 if (channels.empty())
                 {
                     if (g_DebugEnabled)
-                        LOG_INFO("server.loading", "[Ollama Chat] Bot {} skipping event chatter (all available channels disabled)", botPtr->GetName());
+                        LOG_INFO("playerbots", "[Ollama Chat] Bot {} skipping event chatter (all available channels disabled)", botPtr->GetName());
                     return;
                 }
                 
@@ -389,34 +410,40 @@ void OllamaBotEventChatter::QueueEvent(Player* bot, std::string type, std::strin
                 if (selectedChannel == "Say")
                 {
                     if (g_DebugEnabled)
-                        LOG_INFO("server.loading", "[Ollama Chat] Bot Event Chatter Say: {}", response);
+                        LOG_INFO("playerbots", "[Ollama Chat] Bot Event Chatter Say: {}", response);
                     botAI->Say(response);
+                    AppendChannelHistory(GetChannelHistoryKey(SRC_SAY_LOCAL, botPtr), botPtr->GetName(), response);
                 }
                 else if (selectedChannel == "General")
                 {
                     if (g_DebugEnabled)
-                        LOG_INFO("server.loading", "[Ollama Chat] Bot Event Chatter General: {}", response);
-                    
+                        LOG_INFO("playerbots", "[Ollama Chat] Bot Event Chatter General: {}", response);
+
                     // Use playerbots' SayToChannel method if available, otherwise use direct channel access
                     if (!botAI->SayToChannel(response, ChatChannelId::GENERAL))
                     {
                         // Fallback to Say if channel message failed
                         if (g_DebugEnabled)
-                            LOG_INFO("server.loading", "[Ollama Chat] Failed to send to General channel, falling back to Say");
+                            LOG_INFO("playerbots", "[Ollama Chat] Failed to send to General channel, falling back to Say");
                         botAI->Say(response);
+                        AppendChannelHistory(GetChannelHistoryKey(SRC_SAY_LOCAL, botPtr), botPtr->GetName(), response);
+                    }
+                    else
+                    {
+                        AppendChannelHistory(GetChannelHistoryKey(SRC_GENERAL_LOCAL, botPtr), botPtr->GetName(), response);
                     }
                 }
             }
         }
         catch (const std::exception& e)
         {
-            LOG_ERROR("server.loading", "[OllamaChat] Exception in QueueEvent thread: {}", e.what());
+            LOG_ERROR("playerbots", "[OllamaChat] Exception in QueueEvent thread: {}", e.what());
         }
-    }).detach();
+    });
 }
 
 
-std::string OllamaBotEventChatter::BuildPrompt(Player* bot, std::string promptTemplate, std::string eventType, std::string eventDetail, std::string actorName)
+std::string OllamaBotEventChatter::BuildPrompt(Player* bot, std::string promptTemplate, std::string eventType, std::string eventDetail, std::string actorName, bool isGuildEvent)
 {
     if (!bot) return "";
 
@@ -451,7 +478,14 @@ std::string OllamaBotEventChatter::BuildPrompt(Player* bot, std::string promptTe
         }
     }
 
-    return SafeFormat(
+    // Mirrors the destination logic in QueueEvent so the bot sees the history of the channel
+    // its response will actually land in.
+    ChatChannelSourceLocal historySource = (isGuildEvent && bot->GetGuild())
+        ? SRC_GUILD_LOCAL
+        : (bot->GetGroup() ? SRC_PARTY_LOCAL : SRC_GENERAL_LOCAL);
+    std::string channelHistory = GetChannelHistoryPrompt(GetChannelHistoryKey(historySource, bot));
+
+    std::string prompt = SafeFormat(
         promptTemplate,
         fmt::arg("bot_name", botName),
         fmt::arg("bot_level", botLevel),
@@ -468,8 +502,21 @@ std::string OllamaBotEventChatter::BuildPrompt(Player* bot, std::string promptTe
         fmt::arg("event_type", eventType),
         fmt::arg("event_detail", eventDetail),
         fmt::arg("actor_name", actorName),
-        fmt::arg("sentiment_info", sentimentInfo)
+        fmt::arg("sentiment_info", sentimentInfo),
+        fmt::arg("channel_history", channelHistory)
     );
+
+    // Ground the event reaction in real WoW knowledge instead of letting the model invent lore.
+    if (g_EnableRAG && g_RAGSystem)
+    {
+        std::string ragQuery = eventType + " " + eventDetail + " " + botClass;
+        auto ragResults = g_RAGSystem->RetrieveRelevantInfo(ragQuery, g_RAGMaxRetrievedItems, g_RAGSimilarityThreshold);
+        std::string ragContent = g_RAGSystem->GetFormattedRAGInfo(ragResults);
+        if (!ragContent.empty())
+            prompt += "\n" + SafeFormat(g_RAGPromptTemplate, fmt::arg("rag_info", ragContent));
+    }
+
+    return prompt;
 }
 
 // === Script Hooks ===

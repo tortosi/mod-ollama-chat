@@ -25,6 +25,19 @@ void ProcessBotChatMessage(Player* bot, const std::string& msg, ChatChannelSourc
 
 void SaveBotConversationHistoryToDB();
 
+// Shared multi-bot channel context: unlike the per (bot, player) conversation history,
+// this tracks the last few lines actually said by anyone (bots and players alike) in a
+// given channel/guild/group/local-area, so every bot replying there sees what was already said.
+std::string GetChannelHistoryKey(ChatChannelSourceLocal sourceLocal, Player* actor);
+void AppendChannelHistory(const std::string& channelKey, const std::string& speakerName, const std::string& message);
+std::string GetChannelHistoryPrompt(const std::string& channelKey);
+void PruneInactiveHistory(uint32_t inactivityMinutes);
+
+// True if candidateReply is a near-duplicate (word-overlap based) of a recent line in the same
+// shared channel history — a safety net for when the model imitates the pattern it's shown
+// instead of avoiding it, regardless of how the prompt asks it not to repeat.
+bool IsTooSimilarToChannelHistory(const std::string& channelKey, const std::string& candidateReply);
+
 class PlayerBotChatHandler : public PlayerScript
 {
 public:

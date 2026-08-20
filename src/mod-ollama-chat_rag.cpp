@@ -27,7 +27,7 @@ bool OllamaRAGSystem::Initialize()
     std::string fullPath = g_RAGDataPath;
 
     if (!LoadRAGDataFromDirectory(fullPath)) {
-        LOG_ERROR("server.loading", "[Ollama Chat RAG] Failed to load RAG data from directory: {}", fullPath);
+        LOG_ERROR("playerbots", "[Ollama Chat RAG] Failed to load RAG data from directory: {}", fullPath);
         return false;
     }
 
@@ -48,7 +48,7 @@ bool OllamaRAGSystem::Initialize()
     m_vocabulary.assign(vocabSet.begin(), vocabSet.end());
 
     m_initialized = true;
-    LOG_INFO("server.loading", "[Ollama Chat RAG] Initialized with {} entries and {} vocabulary terms",
+    LOG_INFO("playerbots", "[Ollama Chat RAG] Initialized with {} entries and {} vocabulary terms",
              m_ragEntries.size(), m_vocabulary.size());
 
     return true;
@@ -58,12 +58,12 @@ bool OllamaRAGSystem::LoadRAGDataFromDirectory(const std::string& directoryPath)
 {
     try {
         if (!fs::exists(directoryPath)) {
-            LOG_ERROR("server.loading", "[Ollama Chat RAG] Directory does not exist: {}", directoryPath);
+            LOG_ERROR("playerbots", "[Ollama Chat RAG] Directory does not exist: {}", directoryPath);
             return false;
         }
 
         if (!fs::is_directory(directoryPath)) {
-            LOG_ERROR("server.loading", "[Ollama Chat RAG] Path is not a directory: {}", directoryPath);
+            LOG_ERROR("playerbots", "[Ollama Chat RAG] Path is not a directory: {}", directoryPath);
             return false;
         }
 
@@ -76,11 +76,11 @@ bool OllamaRAGSystem::LoadRAGDataFromDirectory(const std::string& directoryPath)
             }
         }
 
-        LOG_INFO("server.loading", "[Ollama Chat RAG] Loaded {} JSON files from {}", loadedFiles, directoryPath);
+        LOG_INFO("playerbots", "[Ollama Chat RAG] Loaded {} JSON files from {}", loadedFiles, directoryPath);
         return loadedFiles > 0;
     }
     catch (const std::exception& e) {
-        LOG_ERROR("server.loading", "[Ollama Chat RAG] Error loading directory {}: {}", directoryPath, e.what());
+        LOG_ERROR("playerbots", "[Ollama Chat RAG] Error loading directory {}: {}", directoryPath, e.what());
         return false;
     }
 }
@@ -90,7 +90,7 @@ bool OllamaRAGSystem::LoadRAGDataFromFile(const std::string& filePath)
     try {
         std::ifstream file(filePath);
         if (!file.is_open()) {
-            LOG_ERROR("server.loading", "[Ollama Chat RAG] Cannot open file: {}", filePath);
+            LOG_ERROR("playerbots", "[Ollama Chat RAG] Cannot open file: {}", filePath);
             return false;
         }
 
@@ -98,7 +98,7 @@ bool OllamaRAGSystem::LoadRAGDataFromFile(const std::string& filePath)
         file >> jsonData;
 
         if (!jsonData.is_array()) {
-            LOG_ERROR("server.loading", "[Ollama Chat RAG] JSON file must contain an array of entries: {}", filePath);
+            LOG_ERROR("playerbots", "[Ollama Chat RAG] JSON file must contain an array of entries: {}", filePath);
             return false;
         }
 
@@ -111,7 +111,7 @@ bool OllamaRAGSystem::LoadRAGDataFromFile(const std::string& filePath)
                 entry.content = item.value("content", "");
 
                 if (entry.id.empty() || entry.content.empty()) {
-                    LOG_ERROR("server.loading", "[Ollama Chat RAG] Entry missing required 'id' or 'content' field in file: {}", filePath);
+                    LOG_ERROR("playerbots", "[Ollama Chat RAG] Entry missing required 'id' or 'content' field in file: {}", filePath);
                     continue;
                 }
 
@@ -133,15 +133,15 @@ bool OllamaRAGSystem::LoadRAGDataFromFile(const std::string& filePath)
                 entriesLoaded++;
             }
             catch (const std::exception& e) {
-                LOG_ERROR("server.loading", "[Ollama Chat RAG] Error parsing entry in {}: {}", filePath, e.what());
+                LOG_ERROR("playerbots", "[Ollama Chat RAG] Error parsing entry in {}: {}", filePath, e.what());
             }
         }
 
-        LOG_INFO("server.loading", "[Ollama Chat RAG] Loaded {} entries from {}", entriesLoaded, filePath);
+        LOG_INFO("playerbots", "[Ollama Chat RAG] Loaded {} entries from {}", entriesLoaded, filePath);
         return entriesLoaded > 0;
     }
     catch (const std::exception& e) {
-        LOG_ERROR("server.loading", "[Ollama Chat RAG] Error loading file {}: {}", filePath, e.what());
+        LOG_ERROR("playerbots", "[Ollama Chat RAG] Error loading file {}: {}", filePath, e.what());
         return false;
     }
 }

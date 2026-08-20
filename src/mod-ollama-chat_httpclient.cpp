@@ -29,7 +29,7 @@ std::string OllamaHttpClient::Post(const std::string& url, const std::string& js
         
         if (!std::regex_match(url, match, urlRegex))
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Invalid URL format: {}", url);
+            LOG_INFO("playerbots", "[Ollama Chat] Invalid URL format: {}", url);
             return "";
         }
         
@@ -53,7 +53,7 @@ std::string OllamaHttpClient::Post(const std::string& url, const std::string& js
         
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] HTTP Request - Protocol: {}, Host: {}, Port: {}, Path: {}", 
+            LOG_INFO("playerbots", "[Ollama Chat] HTTP Request - Protocol: {}, Host: {}, Port: {}, Path: {}", 
                 protocol, host, port, path);
         }
         
@@ -70,7 +70,7 @@ std::string OllamaHttpClient::Post(const std::string& url, const std::string& js
             sslClient.set_write_timeout(m_timeout);
             
             if(g_DebugEnabled) {
-                LOG_INFO("server.loading", "[Ollama Chat] Using SSL client for HTTPS connection");
+                LOG_INFO("playerbots", "[Ollama Chat] Using SSL client for HTTPS connection");
             }
             
             // Set headers (with ngrok-specific headers)
@@ -84,16 +84,16 @@ std::string OllamaHttpClient::Post(const std::string& url, const std::string& js
             if (host.find("ngrok") != std::string::npos || host.find("ngrok-free.app") != std::string::npos) {
                 headers.emplace("ngrok-skip-browser-warning", "true");
                 if(g_DebugEnabled) {
-                    LOG_INFO("server.loading", "[Ollama Chat] Added ngrok bypass header");
+                    LOG_INFO("playerbots", "[Ollama Chat] Added ngrok bypass header");
                 }
             }
             
             // Make POST request with SSL client
             response = sslClient.Post(path, headers, jsonData, "application/json");
 #else
-            LOG_ERROR("server.loading", "[Ollama Chat] HTTPS requested but SSL support not available.");
-            LOG_ERROR("server.loading", "[Ollama Chat] Please rebuild with OpenSSL support enabled.");
-            LOG_ERROR("server.loading", "[Ollama Chat] See CMake output for OpenSSL installation instructions.");
+            LOG_ERROR("playerbots", "[Ollama Chat] HTTPS requested but SSL support not available.");
+            LOG_ERROR("playerbots", "[Ollama Chat] Please rebuild with OpenSSL support enabled.");
+            LOG_ERROR("playerbots", "[Ollama Chat] See CMake output for OpenSSL installation instructions.");
             return "";
 #endif
         } else {
@@ -103,7 +103,7 @@ std::string OllamaHttpClient::Post(const std::string& url, const std::string& js
             client.set_write_timeout(m_timeout);
             
             if(g_DebugEnabled) {
-                LOG_INFO("server.loading", "[Ollama Chat] Using standard HTTP client");
+                LOG_INFO("playerbots", "[Ollama Chat] Using standard HTTP client");
             }
             
             // Set headers (with ngrok-specific headers)
@@ -117,7 +117,7 @@ std::string OllamaHttpClient::Post(const std::string& url, const std::string& js
             if (host.find("ngrok") != std::string::npos || host.find("ngrok-free.app") != std::string::npos) {
                 headers.emplace("ngrok-skip-browser-warning", "true");
                 if(g_DebugEnabled) {
-                    LOG_INFO("server.loading", "[Ollama Chat] Added ngrok bypass header");
+                    LOG_INFO("playerbots", "[Ollama Chat] Added ngrok bypass header");
                 }
             }
             
@@ -127,31 +127,31 @@ std::string OllamaHttpClient::Post(const std::string& url, const std::string& js
         
         if (!response)
         {
-            LOG_ERROR("server.loading", "[Ollama Chat] HTTP request failed - no response from {}:{}{}", host, port, path);
+            LOG_ERROR("playerbots", "[Ollama Chat] HTTP request failed - no response from {}:{}{}", host, port, path);
             return "";
         }
         
         if (response->status != 200)
         {
-            LOG_ERROR("server.loading", "[Ollama Chat] HTTP request failed with status: {} for {}:{}{}", 
+            LOG_ERROR("playerbots", "[Ollama Chat] HTTP request failed with status: {} for {}:{}{}", 
                 response->status, host, port, path);
             if(g_DebugEnabled)
             {
-                LOG_INFO("server.loading", "[Ollama Chat] Response body: {}", response->body);
+                LOG_INFO("playerbots", "[Ollama Chat] Response body: {}", response->body);
             }
             return "";
         }
         
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] HTTP request successful, response length: {}", response->body.length());
+            LOG_INFO("playerbots", "[Ollama Chat] HTTP request successful, response length: {}", response->body.length());
         }
         
         return response->body;
     }
     catch (const std::exception& e)
     {
-        LOG_ERROR("server.loading", "[Ollama Chat] HTTP client exception: {}", e.what());
+        LOG_ERROR("playerbots", "[Ollama Chat] HTTP client exception: {}", e.what());
         return "";
     }
 }

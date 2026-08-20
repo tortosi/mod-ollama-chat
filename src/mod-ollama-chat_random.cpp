@@ -12,8 +12,11 @@
 #include "Channel.h"
 #include "fmt/core.h"
 #include "mod-ollama-chat_api.h"
+#include "mod-ollama-chat_threadpool.h"
+#include "mod-ollama-chat_rag.h"
 #include "mod-ollama-chat_personality.h"
 #include "mod-ollama-chat-utilities.h"
+#include "PlayerbotAIConfig.h"
 #include "GridNotifiersImpl.h"
 #include "CellImpl.h"
 #include "Map.h"
@@ -39,6 +42,12 @@ void OllamaBotRandomChatter::OnUpdate(uint32 diff)
     if (!g_Enable)
         return;
 
+    // mod-playerbots gets updated weekly upstream and we don't patch it directly; re-assert this
+    // every tick instead of a one-time config edit, so it survives both ".reload config" and
+    // updates that might reset AiPlayerbot.RandomBotTalk back to its default.
+    if (g_DisableNativePlayerbotChatReply)
+        sPlayerbotAIConfig.randomBotTalk = false;
+
     if (g_ConversationHistorySaveInterval > 0)
     {
         time_t now = time(nullptr);
@@ -46,6 +55,8 @@ void OllamaBotRandomChatter::OnUpdate(uint32 diff)
         {
             SaveBotConversationHistoryToDB();
             g_LastHistorySaveTime = now;
+            // Prune right after saving: anything evicted from memory here is already persisted.
+            PruneInactiveHistory(g_HistoryInactivityMinutes);
         }
     }
 
@@ -68,7 +79,7 @@ void OllamaBotRandomChatter::OnUpdate(uint32 diff)
     {
         timer = 30000;
         if (g_DebugEnabled)
-            LOG_INFO("server.loading", "[Ollama Chat] RandomChatter tick fired (HandleRandomChatter called)");
+            LOG_INFO("playerbots", "[Ollama Chat] RandomChatter tick fired (HandleRandomChatter called)");
         HandleRandomChatter();
     }
     else
@@ -91,6 +102,12 @@ void OllamaBotRandomChatter::HandleRandomChatter()
     }
 
     std::unordered_set<uint64_t> processedBotsThisTick;
+
+    // Caps OllamaChat.RandomChatterMaxBotsPerPlayer for real: how many bots have already
+    // committed to random chatter this tick, per nearby real player (or per guild, for bots
+    // that only qualify via the guild bypass below).
+    std::unordered_map<uint64_t, uint32_t> chatterCountByPlayerThisTick;
+    std::unordered_map<uint32_t, uint32_t> chatterCountByGuildThisTick;
 
     for (auto const& itr : allPlayers)
     {
@@ -121,15 +138,16 @@ void OllamaBotRandomChatter::HandleRandomChatter()
         }
 
         // For non-guild random chatter, require proximity to a real player
-        bool nearRealPlayer = false;
+        Player* nearbyRealPlayer = nullptr;
         for (Player* realPlayer : realPlayers)
         {
             if (bot->GetDistance(realPlayer) <= g_RandomChatterRealPlayerDistance)
             {
-                nearRealPlayer = true;
+                nearbyRealPlayer = realPlayer;
                 break;
             }
         }
+        bool nearRealPlayer = (nearbyRealPlayer != nullptr);
 
         // Guild bots with real guild members online can bypass proximity requirement
         bool allowWithoutProximity = guild && hasRealPlayerInGuild;
@@ -152,6 +170,22 @@ void OllamaBotRandomChatter::HandleRandomChatter()
 
             if(urand(0, 99) >= g_RandomChatterBotCommentChance)
                 continue;
+
+            // Enforce RandomChatterMaxBotsPerPlayer: once enough bots have already committed to
+            // chatter near this real player (or, lacking one, this guild) this tick, the rest
+            // back off instead of also generating a reply that would just pile onto the others.
+            if (g_RandomChatterMaxBotsPerPlayer > 0)
+            {
+                uint32_t& count = nearbyRealPlayer
+                    ? chatterCountByPlayerThisTick[nearbyRealPlayer->GetGUID().GetRawValue()]
+                    : chatterCountByGuildThisTick[guild ? guild->GetId() : 0];
+                if (count >= g_RandomChatterMaxBotsPerPlayer)
+                {
+                    nextRandomChatTime[guid] = now + urand(g_MinRandomInterval, g_MaxRandomInterval);
+                    continue;
+                }
+                ++count;
+            }
 
             std::string environmentInfo;
             std::vector<std::string> candidateComments;
@@ -538,7 +572,7 @@ void OllamaBotRandomChatter::HandleRandomChatter()
             }
 
 
-            auto prompt = [bot, &environmentInfo]()
+            auto prompt = [bot, &environmentInfo, isGuildComment]()
             {
                 PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
                 if (!botAI)
@@ -560,6 +594,11 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                 std::string botZoneName = botCurrentZone ? botAI->GetLocalizedAreaName(botCurrentZone) : "UnknownZone";
                 std::string botMapName  = bot->GetMap() ? bot->GetMap()->GetMapName() : "UnknownMap";
 
+                // isGuildComment is decided above, before the destination channel is picked at
+                // send time, so it's the best info we have yet about where this will land.
+                ChatChannelSourceLocal historySource = isGuildComment ? SRC_GUILD_LOCAL : SRC_GENERAL_LOCAL;
+                std::string channelHistory = GetChannelHistoryPrompt(GetChannelHistoryKey(historySource, bot));
+
                 std::string prompt = SafeFormat(
                     g_RandomChatterPromptTemplate,
                     fmt::arg("bot_name", botName),
@@ -574,38 +613,54 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                     fmt::arg("bot_map", botMapName),
                     fmt::arg("bot_personality", personalityPrompt),
                     fmt::arg("bot_personality_name", personality),
-                    fmt::arg("environment_info", environmentInfo)
+                    fmt::arg("environment_info", environmentInfo),
+                    fmt::arg("channel_history", channelHistory)
                 );
 
                 // Randomly choose between statement variations and question variations
                 bool hasStatements = !g_RandomChatterPromptVariations.empty();
                 bool hasQuestions = !g_RandomChatterQuestionVariations.empty();
-                
+                std::string chosenVariation;
+
                 if (hasStatements && hasQuestions)
                 {
                     // 50/50 chance between statement and question
                     if (urand(0, 1) == 0)
                     {
                         uint32_t varIdx = urand(0, g_RandomChatterPromptVariations.size() - 1);
-                        prompt += " " + g_RandomChatterPromptVariations[varIdx];
+                        chosenVariation = g_RandomChatterPromptVariations[varIdx];
                     }
                     else
                     {
                         uint32_t qIdx = urand(0, g_RandomChatterQuestionVariations.size() - 1);
-                        prompt += " " + g_RandomChatterQuestionVariations[qIdx];
+                        chosenVariation = g_RandomChatterQuestionVariations[qIdx];
                     }
                 }
                 else if (hasStatements)
                 {
                     // Only statements available
                     uint32_t varIdx = urand(0, g_RandomChatterPromptVariations.size() - 1);
-                    prompt += " " + g_RandomChatterPromptVariations[varIdx];
+                    chosenVariation = g_RandomChatterPromptVariations[varIdx];
                 }
                 else if (hasQuestions)
                 {
                     // Only questions available
                     uint32_t qIdx = urand(0, g_RandomChatterQuestionVariations.size() - 1);
-                    prompt += " " + g_RandomChatterQuestionVariations[qIdx];
+                    chosenVariation = g_RandomChatterQuestionVariations[qIdx];
+                }
+
+                if (!chosenVariation.empty())
+                    prompt += " " + chosenVariation;
+
+                // Ground the topic the variation picked (e.g. "the Lich King expansion") in real
+                // WoW knowledge instead of letting the model invent lore to fill the gap.
+                if (g_EnableRAG && g_RAGSystem)
+                {
+                    std::string ragQuery = chosenVariation + " " + botClass + " " + botZoneName;
+                    auto ragResults = g_RAGSystem->RetrieveRelevantInfo(ragQuery, g_RAGMaxRetrievedItems, g_RAGSimilarityThreshold);
+                    std::string ragContent = g_RAGSystem->GetFormattedRAGInfo(ragResults);
+                    if (!ragContent.empty())
+                        prompt += "\n" + SafeFormat(g_RAGPromptTemplate, fmt::arg("rag_info", ragContent));
                 }
 
                 return prompt;
@@ -695,32 +750,47 @@ void OllamaBotRandomChatter::HandleRandomChatter()
             if (!hasValidDestination)
             {
                 if (g_DebugEnabled)
-                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} skipping random chatter (no real player can hear the message)", bot->GetName());
+                    LOG_INFO("playerbots", "[Ollama Chat] Bot {} skipping random chatter (no real player can hear the message)", bot->GetName());
                 nextRandomChatTime[guid] = now + urand(g_MinRandomInterval, g_MaxRandomInterval);
                 continue;
             }
 
             if(g_DebugEnabled)
             {
-                LOG_INFO("server.loading", "[Ollama Chat] Random Message Prompt: {} ", prompt);
+                LOG_INFO("playerbots", "[Ollama Chat] Random Message Prompt: {} ", prompt);
             }
 
             uint64_t botGuid = bot->GetGUID().GetRawValue();
 
-            std::thread([botGuid, prompt, isGuildComment]() {
+            EnqueueOllamaChatTask([botGuid, prompt, isGuildComment]() {
                 try {
                     Player* botPtr = ObjectAccessor::FindPlayer(ObjectGuid(botGuid));
                     if (!botPtr) return;
-                    
-                    // Generate response from LLM
-                    std::string response = QueryOllamaAPI(prompt);
+
+                    // Generate response from LLM, going through QueryManager so this respects
+                    // OllamaChat.MaxConcurrentQueries like every other call path.
+                    auto responseFuture = SubmitQuery(prompt);
+                    if (!responseFuture.valid())
+                        return;
+                    std::string response = responseFuture.get();
                     if (response.empty())
                     {
                         if (g_DebugEnabled)
-                            LOG_INFO("server.loading", "[OllamaChat] Bot skipped random chatter due to API error");
+                            LOG_INFO("playerbots", "[OllamaChat] Bot skipped random chatter due to API error");
                         return;
                     }
-                    
+
+                    {
+                        ChatChannelSourceLocal historySource = isGuildComment ? SRC_GUILD_LOCAL : SRC_GENERAL_LOCAL;
+                        Player* checkBot = ObjectAccessor::FindPlayer(ObjectGuid(botGuid));
+                        if (checkBot && IsTooSimilarToChannelHistory(GetChannelHistoryKey(historySource, checkBot), response))
+                        {
+                            if (g_DebugEnabled)
+                                LOG_INFO("playerbots", "[OllamaChat] Bot skipped random chatter, too similar to recent channel history: {}", response);
+                            return;
+                        }
+                    }
+
                     botPtr = ObjectAccessor::FindPlayer(ObjectGuid(botGuid));
                     if (!botPtr) return;
                     PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(botPtr);
@@ -731,7 +801,7 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                     {
                         uint32_t delay = g_TypingSimulationBaseDelay + (response.length() * g_TypingSimulationDelayPerChar);
                         if (g_DebugEnabled)
-                            LOG_INFO("server.loading", "[OllamaChat] Bot simulating typing delay: {}ms for {} characters", 
+                            LOG_INFO("playerbots", "[OllamaChat] Bot simulating typing delay: {}ms for {} characters", 
                                      delay, response.length());
                         std::this_thread::sleep_for(std::chrono::milliseconds(delay));
                         
@@ -749,7 +819,7 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                         if (g_DisableForGuild)
                         {
                             if (g_DebugEnabled)
-                                LOG_INFO("server.loading", "[Ollama Chat] Guild random chatter skipped (guild channels disabled)");
+                                LOG_INFO("playerbots", "[Ollama Chat] Guild random chatter skipped (guild channels disabled)");
                             return;
                         }
                         
@@ -773,13 +843,13 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                         if (hasRealPlayerInGuild)
                         {
                             if (g_DebugEnabled)
-                                LOG_INFO("server.loading", "[Ollama Chat] Bot Guild-Based Random Chatter: {}", response);
+                                LOG_INFO("playerbots", "[Ollama Chat] Bot Guild-Based Random Chatter: {}", response);
                             botAI->SayToGuild(response);
                             ProcessBotChatMessage(botPtr, response, SRC_GUILD_LOCAL, nullptr);
                         }
                         else if (g_DebugEnabled)
                         {
-                            LOG_INFO("server.loading", "[Ollama Chat] Bot {} skipping guild random chatter (no real players in guild anymore)", botPtr->GetName());
+                            LOG_INFO("playerbots", "[Ollama Chat] Bot {} skipping guild random chatter (no real players in guild anymore)", botPtr->GetName());
                         }
                     }
                     else if (botPtr->GetGroup())
@@ -788,12 +858,12 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                         if (g_DisableForParty)
                         {
                             if (g_DebugEnabled)
-                                LOG_INFO("server.loading", "[Ollama Chat] Party random chatter skipped (party channels disabled)");
+                                LOG_INFO("playerbots", "[Ollama Chat] Party random chatter skipped (party channels disabled)");
                             return;
                         }
                         
                         if (g_DebugEnabled)
-                            LOG_INFO("server.loading", "[Ollama Chat] Bot Random Chatter Party: {}", response);
+                            LOG_INFO("playerbots", "[Ollama Chat] Bot Random Chatter Party: {}", response);
                         botAI->SayToParty(response);
                         ProcessBotChatMessage(botPtr, response, SRC_PARTY_LOCAL, nullptr);
                     }
@@ -847,11 +917,11 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                             {
                                 channels.push_back("General");
                                 if (g_DebugEnabled)
-                                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} adding General to random chatter options (real player in channel)", botPtr->GetName());
+                                    LOG_INFO("playerbots", "[Ollama Chat] Bot {} adding General to random chatter options (real player in channel)", botPtr->GetName());
                             }
                             else if (g_DebugEnabled)
                             {
-                                LOG_INFO("server.loading", "[Ollama Chat] Bot {} NOT adding General to random chatter (no real player in channel)", botPtr->GetName());
+                                LOG_INFO("playerbots", "[Ollama Chat] Bot {} NOT adding General to random chatter (no real player in channel)", botPtr->GetName());
                             }
                         }
                         
@@ -860,21 +930,21 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                         {
                             channels.push_back("Say");
                             if (g_DebugEnabled)
-                                LOG_INFO("server.loading", "[Ollama Chat] Bot {} adding Say to random chatter options (real player within {} yards)", botPtr->GetName(), g_SayDistance);
+                                LOG_INFO("playerbots", "[Ollama Chat] Bot {} adding Say to random chatter options (real player within {} yards)", botPtr->GetName(), g_SayDistance);
                         }
                         else if (g_DebugEnabled)
                         {
                             if (g_DisableForSayYell)
-                                LOG_INFO("server.loading", "[Ollama Chat] Bot {} NOT adding Say to random chatter (Say/Yell disabled)", botPtr->GetName());
+                                LOG_INFO("playerbots", "[Ollama Chat] Bot {} NOT adding Say to random chatter (Say/Yell disabled)", botPtr->GetName());
                             else
-                                LOG_INFO("server.loading", "[Ollama Chat] Bot {} NOT adding Say to random chatter (no real player within {} yards)", botPtr->GetName(), g_SayDistance);
+                                LOG_INFO("playerbots", "[Ollama Chat] Bot {} NOT adding Say to random chatter (no real player within {} yards)", botPtr->GetName(), g_SayDistance);
                         }
                         
                         // If no channels are available, skip random chatter
                         if (channels.empty())
                         {
                             if (g_DebugEnabled)
-                                LOG_INFO("server.loading", "[Ollama Chat] Bot {} skipping random chatter (all available channels disabled)", botPtr->GetName());
+                                LOG_INFO("playerbots", "[Ollama Chat] Bot {} skipping random chatter (all available channels disabled)", botPtr->GetName());
                             return;
                         }
                         
@@ -886,12 +956,12 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                         
                         if (selectedChannel == "Say") {
                             if (g_DebugEnabled)
-                                LOG_INFO("server.loading", "[Ollama Chat] Bot {} Random Chatter Say (real player within {} yards): {}", botPtr->GetName(), g_SayDistance, response);
+                                LOG_INFO("playerbots", "[Ollama Chat] Bot {} Random Chatter Say (real player within {} yards): {}", botPtr->GetName(), g_SayDistance, response);
                             botAI->Say(response);
                             ProcessBotChatMessage(botPtr, response, SRC_SAY_LOCAL, nullptr);
                         } else if (selectedChannel == "General") {
                             if (g_DebugEnabled)
-                                LOG_INFO("server.loading", "[Ollama Chat] Bot {} Random Chatter General: {}", botPtr->GetName(), response);
+                                LOG_INFO("playerbots", "[Ollama Chat] Bot {} Random Chatter General: {}", botPtr->GetName(), response);
                             
                             // Look up the General channel BEFORE sending
                             Channel* generalChannel = nullptr;
@@ -904,7 +974,7 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                             // Use playerbots' SayToChannel method - it handles channel lookup internally
                             bool sent = botAI->SayToChannel(response, ChatChannelId::GENERAL);
                             if (g_DebugEnabled)
-                                LOG_INFO("server.loading", "[Ollama Chat] Bot {} SayToChannel result: {}", botPtr->GetName(), sent ? "success" : "failed, using Say fallback");
+                                LOG_INFO("playerbots", "[Ollama Chat] Bot {} SayToChannel result: {}", botPtr->GetName(), sent ? "success" : "failed, using Say fallback");
                             
                             if (sent && generalChannel)
                             {
@@ -912,7 +982,7 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                             }
                             else if (sent && !generalChannel && g_DebugEnabled)
                             {
-                                LOG_ERROR("server.loading", "[Ollama Chat] Bot {} sent to General but could not find channel for triggering replies", botPtr->GetName());
+                                LOG_ERROR("playerbots", "[Ollama Chat] Bot {} sent to General but could not find channel for triggering replies", botPtr->GetName());
                             }
                             
                             if (!sent)
@@ -925,17 +995,17 @@ void OllamaBotRandomChatter::HandleRandomChatter()
                                 }
                                 else if (g_DebugEnabled)
                                 {
-                                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} cannot send to General and no real player in Say range, message lost", botPtr->GetName());
+                                    LOG_INFO("playerbots", "[Ollama Chat] Bot {} cannot send to General and no real player in Say range, message lost", botPtr->GetName());
                                 }
                             }
                         }
                     }
                 } catch (const std::exception& e) {
-                    LOG_ERROR("server.loading", "[Ollama Chat] Exception in random chatter thread: {}", e.what());
+                    LOG_ERROR("playerbots", "[Ollama Chat] Exception in random chatter thread: {}", e.what());
                 } catch (...) {
-                    LOG_ERROR("server.loading", "[Ollama Chat] Unknown exception in random chatter thread");
+                    LOG_ERROR("playerbots", "[Ollama Chat] Unknown exception in random chatter thread");
                 }
-            }).detach();
+            });
 
 
             nextRandomChatTime[guid] = now + urand(g_MinRandomInterval, g_MaxRandomInterval);

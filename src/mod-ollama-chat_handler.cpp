@@ -21,11 +21,13 @@
 #include <algorithm>
 #include <random>
 #include <cctype>
+#include <unordered_set>
 #include <chrono>
 #include <ctime>
 #include "DatabaseEnv.h"
 #include "mod-ollama-chat_handler.h"
 #include "mod-ollama-chat_api.h"
+#include "mod-ollama-chat_threadpool.h"
 #include "mod-ollama-chat_personality.h"
 #include "mod-ollama-chat_config.h"
 #include "mod-ollama-chat-utilities.h"
@@ -52,7 +54,7 @@
 // Forward declarations for internal helper functions.
 static bool IsBotEligibleForChatChannelLocal(Player* bot, Player* player,
                                              ChatChannelSourceLocal source, Channel* channel = nullptr, Player* receiver = nullptr);
-static std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* player);
+static std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* player, ChatChannelSourceLocal sourceLocal);
 
 // Helper function to format class name for any player
 static std::string FormatPlayerClass(uint8_t classId)
@@ -165,7 +167,7 @@ Channel* GetValidChannel(uint32_t teamId, const std::string& channelName, Player
     {
         if(g_DebugEnabled)
         {
-            LOG_ERROR("server.loading", "[Ollama Chat] Channel '{}' not found for team {}", channelName, teamId);
+            LOG_ERROR("playerbots", "[Ollama Chat] Channel '{}' not found for team {}", channelName, teamId);
         }
     }
     return channel;
@@ -237,7 +239,7 @@ bool PlayerBotChatHandler::OnPlayerCanUseChat(Player* player, uint32_t type, uin
 
     if (g_DebugEnabled)
     {
-        LOG_INFO("server.loading", "[Ollama Chat] OnPlayerCanUseChat called: player={}, type={}, receiver={}",
+        LOG_INFO("playerbots", "[Ollama Chat] OnPlayerCanUseChat called: player={}, type={}, receiver={}",
             player->GetName(), type, receiver ? receiver->GetName() : "null");
     }
 
@@ -249,6 +251,10 @@ bool PlayerBotChatHandler::OnPlayerCanUseChat(Player* player, uint32_t type, uin
     return true;
 }
 
+// Last-touched time per (bot, player) pair, so PruneInactiveHistory() can evict conversations
+// nobody has continued in a while. Guarded by g_ConversationHistoryMutex, same as the history itself.
+static std::unordered_map<uint64_t, std::unordered_map<uint64_t, time_t>> g_BotConversationLastActive;
+
 void AppendBotConversation(uint64_t botGuid, uint64_t playerGuid, const std::string& playerMessage, const std::string& botReply)
 {
     std::lock_guard<std::mutex> lock(g_ConversationHistoryMutex);
@@ -258,7 +264,7 @@ void AppendBotConversation(uint64_t botGuid, uint64_t playerGuid, const std::str
     {
         playerHistory.pop_front();
     }
-
+    g_BotConversationLastActive[botGuid][playerGuid] = time(nullptr);
 }
 
 void SaveBotConversationHistoryToDB()
@@ -327,9 +333,9 @@ void ProcessBotChatMessage(Player* bot, const std::string& msg, ChatChannelSourc
             if (g_DebugEnabled)
             {
                 if (channel)
-                    LOG_INFO("server.loading", "[Ollama Chat] ProcessBotChatMessage: Found General channel for bot {}", bot->GetName());
+                    LOG_INFO("playerbots", "[Ollama Chat] ProcessBotChatMessage: Found General channel for bot {}", bot->GetName());
                 else
-                    LOG_ERROR("server.loading", "[Ollama Chat] ProcessBotChatMessage: Could not find General channel for bot {}", bot->GetName());
+                    LOG_ERROR("playerbots", "[Ollama Chat] ProcessBotChatMessage: Could not find General channel for bot {}", bot->GetName());
             }
         }
     }
@@ -348,7 +354,7 @@ void ProcessBotChatMessage(Player* bot, const std::string& msg, ChatChannelSourc
             // Must have a channel object
             canSendMessage = (channel != nullptr);
             if (!canSendMessage && g_DebugEnabled)
-                LOG_ERROR("server.loading", "[Ollama Chat] Bot {} cannot send to General - no channel found", bot->GetName());
+                LOG_ERROR("playerbots", "[Ollama Chat] Bot {} cannot send to General - no channel found", bot->GetName());
             break;
             
         case SRC_GUILD_LOCAL:
@@ -375,20 +381,20 @@ void ProcessBotChatMessage(Player* bot, const std::string& msg, ChatChannelSourc
                     }
                     canSendMessage = hasRealPlayer;
                     if (!canSendMessage && g_DebugEnabled)
-                        LOG_INFO("server.loading", "[Ollama Chat] Bot {} cannot send to Guild - no real players online in guild", bot->GetName());
+                        LOG_INFO("playerbots", "[Ollama Chat] Bot {} cannot send to Guild - no real players online in guild", bot->GetName());
                 }
                 else
                 {
                     canSendMessage = false;
                     if (g_DebugEnabled)
-                        LOG_ERROR("server.loading", "[Ollama Chat] Bot {} cannot send to Guild - guild not found", bot->GetName());
+                        LOG_ERROR("playerbots", "[Ollama Chat] Bot {} cannot send to Guild - guild not found", bot->GetName());
                 }
             }
             else
             {
                 canSendMessage = false;
                 if (g_DebugEnabled)
-                    LOG_ERROR("server.loading", "[Ollama Chat] Bot {} cannot send to Guild - not in a guild", bot->GetName());
+                    LOG_ERROR("playerbots", "[Ollama Chat] Bot {} cannot send to Guild - not in a guild", bot->GetName());
             }
             break;
             
@@ -410,13 +416,13 @@ void ProcessBotChatMessage(Player* bot, const std::string& msg, ChatChannelSourc
                 }
                 canSendMessage = hasRealPlayer;
                 if (!canSendMessage && g_DebugEnabled)
-                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} cannot send to Party - no real players in group", bot->GetName());
+                    LOG_INFO("playerbots", "[Ollama Chat] Bot {} cannot send to Party - no real players in group", bot->GetName());
             }
             else
             {
                 canSendMessage = false;
                 if (g_DebugEnabled)
-                    LOG_ERROR("server.loading", "[Ollama Chat] Bot {} cannot send to Party - not in a group", bot->GetName());
+                    LOG_ERROR("playerbots", "[Ollama Chat] Bot {} cannot send to Party - not in a group", bot->GetName());
             }
             break;
             
@@ -433,7 +439,7 @@ void ProcessBotChatMessage(Player* bot, const std::string& msg, ChatChannelSourc
     if (!canSendMessage)
     {
         if (g_DebugEnabled)
-            LOG_ERROR("server.loading", "[Ollama Chat] Bot {} cannot send message to {} - validation failed", 
+            LOG_ERROR("playerbots", "[Ollama Chat] Bot {} cannot send message to {} - validation failed", 
                     bot->GetName(), ChatChannelSourceLocalStr[sourceLocal]);
         return;
     }
@@ -458,6 +464,255 @@ void ProcessBotChatMessage(Player* bot, const std::string& msg, ChatChannelSourc
     
     // Call the main ProcessChat function with bot as sender
     PlayerBotChatHandler::ProcessChat(bot, type, lang, mutableMsg, sourceLocal, channel, nullptr);
+}
+
+// Buffer of the last few lines actually said by anyone in a given channel/guild/group/local-area,
+// keyed by GetChannelHistoryKey. Unlike g_BotConversationHistory (per bot+player pair), this is
+// shared by every bot replying in that same context, so they can see each other's messages.
+static std::mutex g_ChannelHistoryMutex;
+static std::unordered_map<std::string, std::deque<std::pair<std::string, std::string>>> g_ChannelHistoryMap;
+// Last-touched time per channel key, so PruneInactiveHistory() can evict channels/zones nobody
+// has spoken in for a while. Guarded by g_ChannelHistoryMutex, same as the map above.
+static std::unordered_map<std::string, time_t> g_ChannelHistoryLastActive;
+
+std::string GetChannelHistoryKey(ChatChannelSourceLocal sourceLocal, Player* actor)
+{
+    if (!actor)
+        return "";
+
+    switch (sourceLocal)
+    {
+        // General/Say/Yell all share the same audience in practice: General is faction+zone
+        // scoped and Say/Yell only carry within earshot, so a per faction+zone buffer is a
+        // reasonable shared context for all of them.
+        case SRC_GENERAL_LOCAL:
+        case SRC_SAY_LOCAL:
+        case SRC_YELL_LOCAL:
+            return SafeFormat("local:{}:{}", (int)actor->GetTeamId(), actor->GetZoneId());
+        case SRC_GUILD_LOCAL:
+            return actor->GetGuildId() ? SafeFormat("guild:{}", actor->GetGuildId()) : "";
+        case SRC_OFFICER_LOCAL:
+            return actor->GetGuildId() ? SafeFormat("officer:{}", actor->GetGuildId()) : "";
+        case SRC_PARTY_LOCAL:
+        case SRC_RAID_LOCAL:
+            return actor->GetGroup() ? SafeFormat("group:{}", actor->GetGroup()->GetGUID().GetRawValue()) : "";
+        default:
+            // Whispers keep their own private per-pair history; no shared channel context.
+            return "";
+    }
+}
+
+void AppendChannelHistory(const std::string& channelKey, const std::string& speakerName, const std::string& message)
+{
+    if (!g_EnableChannelHistory || channelKey.empty() || message.empty())
+        return;
+
+    std::lock_guard<std::mutex> lock(g_ChannelHistoryMutex);
+    auto& history = g_ChannelHistoryMap[channelKey];
+    history.push_back({ speakerName, message });
+    while (history.size() > g_MaxChannelHistory)
+    {
+        history.pop_front();
+    }
+    g_ChannelHistoryLastActive[channelKey] = time(nullptr);
+}
+
+// Evicts channel-history and per bot+player conversation-history entries that haven't been
+// touched in inactivityMinutes, so long-running servers don't accumulate memory for zones/guilds/
+// players nobody talks to anymore. Called periodically from OllamaBotRandomChatter::OnUpdate.
+void PruneInactiveHistory(uint32_t inactivityMinutes)
+{
+    if (inactivityMinutes == 0)
+        return;
+
+    time_t cutoff = time(nullptr) - static_cast<time_t>(inactivityMinutes) * 60;
+
+    {
+        std::lock_guard<std::mutex> lock(g_ChannelHistoryMutex);
+        for (auto it = g_ChannelHistoryLastActive.begin(); it != g_ChannelHistoryLastActive.end(); )
+        {
+            if (it->second < cutoff)
+            {
+                g_ChannelHistoryMap.erase(it->first);
+                it = g_ChannelHistoryLastActive.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_ConversationHistoryMutex);
+        for (auto botIt = g_BotConversationLastActive.begin(); botIt != g_BotConversationLastActive.end(); )
+        {
+            auto histBotIt = g_BotConversationHistory.find(botIt->first);
+            for (auto playerIt = botIt->second.begin(); playerIt != botIt->second.end(); )
+            {
+                if (playerIt->second < cutoff)
+                {
+                    if (histBotIt != g_BotConversationHistory.end())
+                        histBotIt->second.erase(playerIt->first);
+                    playerIt = botIt->second.erase(playerIt);
+                }
+                else
+                {
+                    ++playerIt;
+                }
+            }
+
+            if (botIt->second.empty())
+            {
+                g_BotConversationHistory.erase(botIt->first);
+                botIt = g_BotConversationLastActive.erase(botIt);
+            }
+            else
+            {
+                ++botIt;
+            }
+        }
+    }
+}
+
+std::string GetChannelHistoryPrompt(const std::string& channelKey)
+{
+    if (!g_EnableChannelHistory || channelKey.empty())
+        return "";
+
+    std::lock_guard<std::mutex> lock(g_ChannelHistoryMutex);
+    const auto it = g_ChannelHistoryMap.find(channelKey);
+    if (it == g_ChannelHistoryMap.end() || it->second.empty())
+        return "";
+
+    std::string result = g_ChannelHistoryHeaderTemplate;
+    for (const auto& entry : it->second)
+    {
+        result += SafeFormat(g_ChannelHistoryLineTemplate,
+            fmt::arg("speaker_name", entry.first),
+            fmt::arg("message", entry.second)
+        );
+    }
+    return result;
+}
+
+// Lowercases and splits on non-alphanumeric ASCII, treating any high-bit (UTF-8 accented/multi-
+// byte) byte as a word character. Good enough for a word-overlap similarity check, not meant to
+// be locale-correct tokenization.
+static std::unordered_set<std::string> TokenizeForSimilarity(const std::string& text)
+{
+    std::unordered_set<std::string> words;
+    std::string current;
+    for (unsigned char c : text)
+    {
+        if (std::isalnum(c) || (c & 0x80))
+        {
+            current += static_cast<char>(std::tolower(c));
+        }
+        else if (!current.empty())
+        {
+            words.insert(current);
+            current.clear();
+        }
+    }
+    if (!current.empty())
+        words.insert(current);
+    return words;
+}
+
+static float JaccardSimilarity(const std::unordered_set<std::string>& a, const std::unordered_set<std::string>& b)
+{
+    if (a.empty() || b.empty())
+        return 0.0f;
+    size_t intersection = 0;
+    for (const auto& word : a)
+    {
+        if (b.count(word))
+            ++intersection;
+    }
+    size_t unionSize = a.size() + b.size() - intersection;
+    return unionSize == 0 ? 0.0f : static_cast<float>(intersection) / static_cast<float>(unionSize);
+}
+
+// Same alphabet as TokenizeForSimilarity, but ordered/with duplicates so consecutive n-grams can be compared.
+static std::vector<std::string> TokenizeOrdered(const std::string& text)
+{
+    std::vector<std::string> words;
+    std::string current;
+    for (unsigned char c : text)
+    {
+        if (std::isalnum(c) || (c & 0x80))
+        {
+            current += static_cast<char>(std::tolower(c));
+        }
+        else if (!current.empty())
+        {
+            words.push_back(current);
+            current.clear();
+        }
+    }
+    if (!current.empty())
+        words.push_back(current);
+    return words;
+}
+
+// Catches bots recycling the same anchor phrase (e.g. "cura de 12") across many replies even when
+// the rest of the sentence differs enough that word-bag Jaccard similarity stays low.
+static bool SharesRepeatedPhrase(const std::string& a, const std::string& b, size_t minWords = 3)
+{
+    std::vector<std::string> wordsA = TokenizeOrdered(a);
+    std::vector<std::string> wordsB = TokenizeOrdered(b);
+    if (wordsA.size() < minWords || wordsB.size() < minWords)
+        return false;
+
+    std::unordered_set<std::string> phrasesA;
+    for (size_t i = 0; i + minWords <= wordsA.size(); ++i)
+    {
+        std::string phrase;
+        for (size_t j = 0; j < minWords; ++j)
+        {
+            if (j) phrase += ' ';
+            phrase += wordsA[i + j];
+        }
+        phrasesA.insert(phrase);
+    }
+
+    for (size_t i = 0; i + minWords <= wordsB.size(); ++i)
+    {
+        std::string phrase;
+        for (size_t j = 0; j < minWords; ++j)
+        {
+            if (j) phrase += ' ';
+            phrase += wordsB[i + j];
+        }
+        if (phrasesA.count(phrase))
+            return true;
+    }
+    return false;
+}
+
+bool IsTooSimilarToChannelHistory(const std::string& channelKey, const std::string& candidateReply)
+{
+    if (!g_EnableDuplicateReplyFilter || channelKey.empty() || candidateReply.empty())
+        return false;
+
+    auto candidateWords = TokenizeForSimilarity(candidateReply);
+    if (candidateWords.empty())
+        return false;
+
+    std::lock_guard<std::mutex> lock(g_ChannelHistoryMutex);
+    const auto it = g_ChannelHistoryMap.find(channelKey);
+    if (it == g_ChannelHistoryMap.end())
+        return false;
+
+    for (const auto& entry : it->second)
+    {
+        if (JaccardSimilarity(candidateWords, TokenizeForSimilarity(entry.second)) >= g_DuplicateReplySimilarityThreshold)
+            return true;
+        if (SharesRepeatedPhrase(candidateReply, entry.second))
+            return true;
+    }
+    return false;
 }
 
 std::string GetBotHistoryPrompt(uint64_t botGuid, uint64_t playerGuid, std::string playerMessage)
@@ -817,7 +1072,7 @@ static std::string GenerateBotGameStateSnapshot(Player* bot)
 void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32_t lang, std::string& msg, ChatChannelSourceLocal sourceLocal, Channel* channel, Player* receiver)
 {
     if (player == nullptr) {
-        LOG_ERROR("server.loading", "[Ollama Chat] ProcessChat: player is null");
+        LOG_ERROR("playerbots", "[Ollama Chat] ProcessChat: player is null");
         return;
     }
     if (msg.empty()) {
@@ -829,7 +1084,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     std::string receiverName = (receiver != nullptr) ? receiver->GetName() : "None";
     if(g_DebugEnabled)
     {
-        LOG_INFO("server.loading",
+        LOG_INFO("playerbots",
                 "[Ollama Chat] Player {} sent msg: '{}' | Source: {} | Channel Name: {} | Channel ID: {} | Receiver: {}",
                 player->GetName(), msg, (int)sourceLocal, chanName, channelId, receiverName);
     }
@@ -848,7 +1103,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         if (startsWithWord(trimmedMsg, blacklist))
         {
             if (g_DebugEnabled)
-                LOG_INFO("server.loading",
+                LOG_INFO("playerbots",
                          "[Ollama Chat] Message starts with '{}' (blacklisted). Skipping bot responses.",
                          blacklist);
             return;
@@ -860,7 +1115,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     {
         if (g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Custom channels are disabled, skipping");
+            LOG_INFO("playerbots", "[Ollama Chat] Custom channels are disabled, skipping");
         }
         return;
     }
@@ -869,7 +1124,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     {
         if (g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Say/Yell channels are disabled, skipping");
+            LOG_INFO("playerbots", "[Ollama Chat] Say/Yell channels are disabled, skipping");
         }
         return;
     }
@@ -878,7 +1133,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     {
         if (g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Guild channels are disabled, skipping");
+            LOG_INFO("playerbots", "[Ollama Chat] Guild channels are disabled, skipping");
         }
         return;
     }
@@ -887,14 +1142,18 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     {
         if (g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Party/Raid channels are disabled, skipping");
+            LOG_INFO("playerbots", "[Ollama Chat] Party/Raid channels are disabled, skipping");
         }
         return;
     }
              
+    // Record this message (from a real player, or from a bot via ProcessBotChatMessage) into the
+    // shared channel buffer so every bot that replies here can see what was already said.
+    AppendChannelHistory(GetChannelHistoryKey(sourceLocal, player), player->GetName(), msg);
+
     PlayerbotAI* senderAI = PlayerbotsMgr::instance().GetPlayerbotAI(player);
     bool senderIsBot = (senderAI && senderAI->IsBotAI());
-    
+
     std::vector<Player*> eligibleBots;
     
     // Handle different chat sources differently
@@ -905,14 +1164,14 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         {
             if(g_DebugEnabled)
             {
-                LOG_INFO("server.loading", "[Ollama Chat] Whisper replies are disabled, skipping");
+                LOG_INFO("playerbots", "[Ollama Chat] Whisper replies are disabled, skipping");
             }
             return;
         }
         
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Processing whisper from {} to {}", 
+            LOG_INFO("playerbots", "[Ollama Chat] Processing whisper from {} to {}", 
                     player->GetName(), receiver->GetName());
         }
         
@@ -929,12 +1188,12 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             eligibleBots.push_back(receiver);
             if(g_DebugEnabled)
             {
-                LOG_INFO("server.loading", "[Ollama Chat] Found eligible bot {} for whisper", receiver->GetName());
+                LOG_INFO("playerbots", "[Ollama Chat] Found eligible bot {} for whisper", receiver->GetName());
             }
         }
         else if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Whisper target {} is not a bot or has no AI", receiver->GetName());
+            LOG_INFO("playerbots", "[Ollama Chat] Whisper target {} is not a bot or has no AI", receiver->GetName());
         }
     }
     else if (channel != nullptr)
@@ -942,7 +1201,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         // For channel chat, find all bots that are in the same channel instance
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Processing channel message in '{}' (ID: {})", 
+            LOG_INFO("playerbots", "[Ollama Chat] Processing channel message in '{}' (ID: {})", 
                     channel->GetName(), channel->GetChannelId());
         }
         
@@ -951,7 +1210,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         {
             if(g_DebugEnabled)
             {
-                LOG_ERROR("server.loading", "[Ollama Chat] Channel is null, cannot process channel message");
+                LOG_ERROR("playerbots", "[Ollama Chat] Channel is null, cannot process channel message");
             }
             return;
         }
@@ -984,7 +1243,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 {
                     if(g_DebugEnabled)
                     {
-                        //LOG_ERROR("server.loading", "[Ollama Chat] Bot {} FAILED zone check - Bot zone: {}, Player zone: {}, Channel: '{}'", candidate->GetName(), candidate->GetZoneId(), player->GetZoneId(), channel->GetName());
+                        //LOG_ERROR("playerbots", "[Ollama Chat] Bot {} FAILED zone check - Bot zone: {}, Player zone: {}, Channel: '{}'", candidate->GetName(), candidate->GetZoneId(), player->GetZoneId(), channel->GetName());
                     }
                     continue; // SKIP this bot - wrong zone
                 }
@@ -996,7 +1255,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             {
                 if(g_DebugEnabled)
                 {
-                    //LOG_INFO("server.loading", "[Ollama Chat] Bot {} not in channel '{}', skipping", candidate->GetName(), channel->GetName());
+                    //LOG_INFO("playerbots", "[Ollama Chat] Bot {} not in channel '{}', skipping", candidate->GetName(), channel->GetName());
                 }
                 continue;
             }
@@ -1008,7 +1267,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 {
                     if(g_DebugEnabled)
                     {
-                        //LOG_ERROR("server.loading", "[Ollama Chat] Bot {} FAILED faction check - Bot: {}, Player: {}, Channel: '{}'", candidate->GetName(), (int)candidate->GetTeamId(), (int)player->GetTeamId(), channel->GetName());
+                        //LOG_ERROR("playerbots", "[Ollama Chat] Bot {} FAILED faction check - Bot: {}, Player: {}, Channel: '{}'", candidate->GetName(), (int)candidate->GetTeamId(), (int)player->GetTeamId(), channel->GetName());
                     }
                     continue; // SKIP this bot - wrong faction
                 }
@@ -1019,7 +1278,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             {
                 if(g_DebugEnabled)
                 {
-                    //LOG_ERROR("server.loading", "[Ollama Chat] Bot {} FAILED channel membership check - Not in channel '{}'", candidate->GetName(), channel->GetName());
+                    //LOG_ERROR("playerbots", "[Ollama Chat] Bot {} FAILED channel membership check - Not in channel '{}'", candidate->GetName(), channel->GetName());
                 }
                 continue; // SKIP this bot - not in the channel
             }
@@ -1044,7 +1303,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             {
                 if(g_DebugEnabled)
                 {
-                    //LOG_INFO("server.loading", "[Ollama Chat] Bot {} skipped - no real players in channel '{}'", candidate->GetName(), channel->GetName());
+                    //LOG_INFO("playerbots", "[Ollama Chat] Bot {} skipped - no real players in channel '{}'", candidate->GetName(), channel->GetName());
                 }
                 continue;
             }
@@ -1053,13 +1312,13 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             eligibleBots.push_back(candidate);
             if(g_DebugEnabled)
             {
-                // LOG_INFO("server.loading", "[Ollama Chat] VERIFIED eligible bot {} in channel '{}' - Distance: {:.2f}, Zone match: {}", candidate->GetName(), channel->GetName(), candidate->GetDistance(player), (candidate->GetZoneId() == player->GetZoneId()));
+                // LOG_INFO("playerbots", "[Ollama Chat] VERIFIED eligible bot {} in channel '{}' - Distance: {:.2f}, Zone match: {}", candidate->GetName(), channel->GetName(), candidate->GetDistance(player), (candidate->GetZoneId() == player->GetZoneId()));
             }
         }
         
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Found {} bots in channel instance '{}'", 
+            LOG_INFO("playerbots", "[Ollama Chat] Found {} bots in channel instance '{}'", 
                     eligibleBots.size(), channel->GetName());
         }
     }
@@ -1192,7 +1451,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     
     if (g_DebugEnabled && notEligibleCount > 0)
     {
-        LOG_INFO("server.loading", "[Ollama Chat] {} bots not eligible for {} (distance/guild/party checks failed)", 
+        LOG_INFO("playerbots", "[Ollama Chat] {} bots not eligible for {} (distance/guild/party checks failed)", 
                 notEligibleCount, ChatChannelSourceLocalStr[sourceLocal]);
     }
     
@@ -1226,7 +1485,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     
     if(g_DebugEnabled)
     {
-        LOG_INFO("server.loading", "[Ollama Chat] Sender: {} ({}), Channel: {}, Reply Chance: {}%, Candidate Bots: {}",
+        LOG_INFO("playerbots", "[Ollama Chat] Sender: {} ({}), Channel: {}, Reply Chance: {}%, Candidate Bots: {}",
                 player->GetName(), senderIsBot ? "BOT" : "PLAYER", ChatChannelSourceLocalStr[sourceLocal], chance, candidateBots.size());
     }
     
@@ -1243,7 +1502,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 finalCandidates.push_back(whisperBot);
                 if(g_DebugEnabled)
                 {
-                    LOG_INFO("server.loading", "[Ollama Chat] Whisper: Bot {} selected to respond", whisperBot->GetName());
+                    LOG_INFO("playerbots", "[Ollama Chat] Whisper: Bot {} selected to respond", whisperBot->GetName());
                 }
             }
         }
@@ -1303,14 +1562,15 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 mentionedBots.emplace_back(pos, bot);
                 if(g_DebugEnabled)
                 {
-                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} mentioned at position {} in message", bot->GetName(), pos);
+                    LOG_INFO("playerbots", "[Ollama Chat] Bot {} mentioned at position {} in message", bot->GetName(), pos);
                 }
             }
         }
 
-        if (!mentionedBots.empty())
+        if (!mentionedBots.empty() && !senderIsBot)
         {
-            // Sort by position to get the first mentioned bot
+            // Guaranteed reply only when a real player names the bot — that's what this feature
+            // is for, so a bot doesn't miss being addressed directly.
             std::sort(mentionedBots.begin(), mentionedBots.end(),
                       [](const std::pair<size_t, Player*> &a, const std::pair<size_t, Player*> &b) { return a.first < b.first; });
             Player* chosen = mentionedBots.front().second;
@@ -1319,9 +1579,34 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 finalCandidates.push_back(chosen);
                 if(g_DebugEnabled)
                 {
-                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} selected (mentioned first at position {})", 
+                    LOG_INFO("playerbots", "[Ollama Chat] Bot {} selected (mentioned first at position {})",
                             chosen->GetName(), mentionedBots.front().first);
                 }
+            }
+        }
+        else if (!mentionedBots.empty() && senderIsBot)
+        {
+            // A bot naming another bot still gets priority over the rest of the candidates, but
+            // must pass the same BotReplyChance roll as any other bot reply. Without this, two
+            // bots that greet each other by name (which the personality/history-aware prompts
+            // encourage) lock into a guaranteed, unrate-limited ping-pong forever.
+            std::sort(mentionedBots.begin(), mentionedBots.end(),
+                      [](const std::pair<size_t, Player*> &a, const std::pair<size_t, Player*> &b) { return a.first < b.first; });
+            Player* chosen = mentionedBots.front().second;
+            uint32_t roll = urand(0, 99);
+            if (roll < chance && !(g_DisableRepliesInCombat && chosen->IsInCombat()))
+            {
+                finalCandidates.push_back(chosen);
+                if(g_DebugEnabled)
+                {
+                    LOG_INFO("playerbots", "[Ollama Chat] Bot {} selected (mentioned by bot, PASSED chance roll {} < {}%)",
+                            chosen->GetName(), roll, chance);
+                }
+            }
+            else if(g_DebugEnabled)
+            {
+                LOG_INFO("playerbots", "[Ollama Chat] Bot {} mentioned by bot but FAILED chance roll ({} >= {}%)",
+                        chosen->GetName(), roll, chance);
             }
         }
         else
@@ -1332,7 +1617,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 {
                     if(g_DebugEnabled)
                     {
-                        LOG_INFO("server.loading", "[Ollama Chat] Bot {} skipped - in combat", bot->GetName());
+                        LOG_INFO("playerbots", "[Ollama Chat] Bot {} skipped - in combat", bot->GetName());
                     }
                     continue;
                 }
@@ -1342,12 +1627,12 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                     finalCandidates.push_back(bot);
                     if(g_DebugEnabled)
                     {
-                        LOG_INFO("server.loading", "[Ollama Chat] Bot {} PASSED chance roll ({} < {}%)", bot->GetName(), roll, chance);
+                        LOG_INFO("playerbots", "[Ollama Chat] Bot {} PASSED chance roll ({} < {}%)", bot->GetName(), roll, chance);
                     }
                 }
                 else if(g_DebugEnabled)
                 {
-                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} FAILED chance roll ({} >= {}%)", bot->GetName(), roll, chance);
+                    LOG_INFO("playerbots", "[Ollama Chat] Bot {} FAILED chance roll ({} >= {}%)", bot->GetName(), roll, chance);
                 }
             }
         }
@@ -1358,11 +1643,11 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     {
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] *** NO BOTS RESPONDING *** to {} from {} in {} channel. "
+            LOG_INFO("playerbots", "[Ollama Chat] *** NO BOTS RESPONDING *** to {} from {} in {} channel. "
                     "Eligible: {}, Candidates: {}, Final: 0, Chance: {}%",
                     senderIsBot ? "BOT" : "PLAYER", player->GetName(), ChatChannelSourceLocalStr[sourceLocal],
                     eligibleBots.size(), candidateBots.size(), chance);
-            LOG_INFO("server.loading", "[Ollama Chat] No eligible bots found to respond to message '{}'. "
+            LOG_INFO("playerbots", "[Ollama Chat] No eligible bots found to respond to message '{}'. "
                     "Source: {}, Eligible bots: {}, Candidate bots: {}, Combat disabled: {}",
                     msg, ChatChannelSourceLocalStr[sourceLocal], eligibleBots.size(), 
                     candidateBots.size(), g_DisableRepliesInCombat);
@@ -1378,7 +1663,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         uint32_t countToPick = urand(1, g_MaxBotsToPick);
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Limiting {} bots to {} (MaxBotsToPick)", finalCandidates.size(), countToPick);
+            LOG_INFO("playerbots", "[Ollama Chat] Limiting {} bots to {} (MaxBotsToPick)", finalCandidates.size(), countToPick);
         }
         finalCandidates.resize(countToPick);
     }
@@ -1391,7 +1676,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             if (!botNames.empty()) botNames += ", ";
             botNames += bot->GetName();
         }
-        LOG_INFO("server.loading", "[Ollama Chat] *** {} BOTS RESPONDING *** to {} from {} in {}: [{}]",
+        LOG_INFO("playerbots", "[Ollama Chat] *** {} BOTS RESPONDING *** to {} from {} in {}: [{}]",
                 finalCandidates.size(), senderIsBot ? "BOT" : "PLAYER", player->GetName(),
                 ChatChannelSourceLocalStr[sourceLocal], botNames);
     }
@@ -1403,15 +1688,15 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         float distance = player->GetDistance(bot);
         if(g_DebugEnabled)
         {
-            LOG_INFO("server.loading", "[Ollama Chat] Bot {} (distance: {}) is set to respond.", bot->GetName(), distance);
+            LOG_INFO("playerbots", "[Ollama Chat] Bot {} (distance: {}) is set to respond.", bot->GetName(), distance);
         }
         if (bot == nullptr) {
             continue;
         }
-        std::string prompt = GenerateBotPrompt(bot, msg, player);
+        std::string prompt = GenerateBotPrompt(bot, msg, player, sourceLocal);
         uint64_t botGuid = bot->GetGUID().GetRawValue();
         
-        std::thread([botGuid, senderGuid, prompt, sourceLocal, channelId = (channel ? channel->GetChannelId() : 0), channelName = (channel ? channel->GetName() : ""), msg]() {
+        EnqueueOllamaChatTask([botGuid, senderGuid, prompt, sourceLocal, channelId = (channel ? channel->GetChannelId() : 0), channelName = (channel ? channel->GetName() : ""), msg]() {
             try {
                 // Use the QueryManager to submit the query.
                 auto responseFuture = SubmitQuery(prompt);
@@ -1428,7 +1713,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 {
                     if(g_DebugEnabled)
                     {
-                        LOG_ERROR("server.loading", "[Ollama Chat] Failed to reacquire bot from GUID {}", botGuid);
+                        LOG_ERROR("playerbots", "[Ollama Chat] Failed to reacquire bot from GUID {}", botGuid);
                     }
                     return;
                 }
@@ -1436,7 +1721,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 {
                     if(g_DebugEnabled)
                     {
-                        LOG_ERROR("server.loading", "[Ollama Chat] Failed to reacquire sender from GUID {}", senderGuid);
+                        LOG_ERROR("playerbots", "[Ollama Chat] Failed to reacquire sender from GUID {}", senderGuid);
                     }
                     return;
                 }
@@ -1444,7 +1729,15 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 {
                     if(g_DebugEnabled)
                     {
-                        LOG_INFO("server.loading", "[OllamaChat] Bot {} skipped reply due to API error", botPtr->GetName());
+                        LOG_INFO("playerbots", "[OllamaChat] Bot {} skipped reply due to API error", botPtr->GetName());
+                    }
+                    return;
+                }
+                if (IsTooSimilarToChannelHistory(GetChannelHistoryKey(sourceLocal, botPtr), response))
+                {
+                    if(g_DebugEnabled)
+                    {
+                        LOG_INFO("playerbots", "[OllamaChat] Bot {} skipped reply, too similar to recent channel history: {}", botPtr->GetName(), response);
                     }
                     return;
                 }
@@ -1453,7 +1746,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 {
                     if(g_DebugEnabled)
                     {
-                        LOG_ERROR("server.loading", "[Ollama Chat] No PlayerbotAI found for bot {}", botPtr->GetName());
+                        LOG_ERROR("playerbots", "[Ollama Chat] No PlayerbotAI found for bot {}", botPtr->GetName());
                     }
                     return;
                 }
@@ -1463,7 +1756,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 {
                     uint32_t delay = g_TypingSimulationBaseDelay + (response.length() * g_TypingSimulationDelayPerChar);
                     if (g_DebugEnabled)
-                        LOG_INFO("server.loading", "[OllamaChat] Bot {} simulating typing delay: {}ms for {} characters", 
+                        LOG_INFO("playerbots", "[OllamaChat] Bot {} simulating typing delay: {}ms for {} characters", 
                                  botPtr->GetName(), delay, response.length());
                     std::this_thread::sleep_for(std::chrono::milliseconds(delay));
                     
@@ -1484,47 +1777,23 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                     if (cMgr)
                     {
                         Channel* targetChannel = cMgr->GetChannel(channelName, botPtr);
-                        if (targetChannel)
+                        if (targetChannel && botPtr->IsInChannel(targetChannel))
                         {
-                            if(g_DebugEnabled)
-                            {
-                                LOG_INFO("server.loading", "[Ollama Chat] Bot {} found channel '{}' (ID: {}), checking membership...", 
-                                        botPtr->GetName(), channelName, targetChannel->GetChannelId());
-                            }
-                            
-                            if (botPtr->IsInChannel(targetChannel))
-                            {
-                                if(g_DebugEnabled)
-                                {
-                                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} is confirmed in channel '{}', sending message...", 
-                                            botPtr->GetName(), channelName);
-                                }
-                                targetChannel->Say(botPtr->GetGUID(), response, LANG_UNIVERSAL);
-                                ProcessBotChatMessage(botPtr, response, SRC_GENERAL_LOCAL, targetChannel);
-                                if(g_DebugEnabled)
-                                {
-                                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} responded in channel {}: {}", 
-                                            botPtr->GetName(), channelName, response);
-                                }
-                            }
-                            else
-                            {
-                                if(g_DebugEnabled)
-                                {
-                                    LOG_ERROR("server.loading", "[Ollama Chat] Bot {} NOT in channel '{}' according to IsInChannel check - skipping reply", 
-                                                botPtr->GetName(), channelName);
-                                }
-                                // Don't fallback to Say - if bot isn't in the channel, don't reply at all
-                            }
+                            // Send first: any debug logging below must never gate or delay delivery.
+                            targetChannel->Say(botPtr->GetGUID(), response, LANG_UNIVERSAL);
+                            LOG_INFO("playerbots", "[OllamaChat] Bot {} responde en el canal '{}': \"{}\"",
+                                    botPtr->GetName(), channelName, response);
+                            ProcessBotChatMessage(botPtr, response, SRC_GENERAL_LOCAL, targetChannel);
                         }
-                        else
+                        else if (g_DebugEnabled)
                         {
-                            if(g_DebugEnabled)
-                            {
-                                LOG_ERROR("server.loading", "[Ollama Chat] Bot {} cannot find channel '{}' (ID: {}) for team {} - skipping reply", 
+                            // Don't fallback to Say - if the channel is missing or the bot isn't in it, don't reply at all
+                            if (!targetChannel)
+                                LOG_ERROR("playerbots", "[Ollama Chat] Bot {} cannot find channel '{}' (ID: {}) for team {} - skipping reply",
                                          botPtr->GetName(), channelName, channelId, (int)botPtr->GetTeamId());
-                            }
-                            // Don't fallback to Say - if channel doesn't exist, don't reply at all
+                            else
+                                LOG_ERROR("playerbots", "[Ollama Chat] Bot {} NOT in channel '{}' according to IsInChannel check - skipping reply",
+                                            botPtr->GetName(), channelName);
                         }
                     }
                 }
@@ -1532,20 +1801,24 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                 {
                     switch (sourceLocal)
                     {
-                        case SRC_GUILD_LOCAL: 
+                        case SRC_GUILD_LOCAL:
                             botAI->SayToGuild(response);
+                            LOG_INFO("playerbots", "[OllamaChat] Bot {} responde en Guild: \"{}\"", botPtr->GetName(), response);
                             ProcessBotChatMessage(botPtr, response, SRC_GUILD_LOCAL, nullptr);
                             break;
-                        case SRC_OFFICER_LOCAL: 
+                        case SRC_OFFICER_LOCAL:
                             botAI->SayToGuild(response);
+                            LOG_INFO("playerbots", "[OllamaChat] Bot {} responde en Officer: \"{}\"", botPtr->GetName(), response);
                             ProcessBotChatMessage(botPtr, response, SRC_OFFICER_LOCAL, nullptr);
                             break;
-                        case SRC_PARTY_LOCAL: 
+                        case SRC_PARTY_LOCAL:
                             botAI->SayToParty(response);
+                            LOG_INFO("playerbots", "[OllamaChat] Bot {} responde en Party: \"{}\"", botPtr->GetName(), response);
                             ProcessBotChatMessage(botPtr, response, SRC_PARTY_LOCAL, nullptr);
                             break;
-                        case SRC_RAID_LOCAL:  
+                        case SRC_RAID_LOCAL:
                             botAI->SayToRaid(response);
+                            LOG_INFO("playerbots", "[OllamaChat] Bot {} responde en Raid: \"{}\"", botPtr->GetName(), response);
                             ProcessBotChatMessage(botPtr, response, SRC_RAID_LOCAL, nullptr);
                             break;
                         case SRC_SAY_LOCAL:
@@ -1567,15 +1840,16 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                                         }
                                     }
                                 }
-                                
+
                                 if (someoneCanHear)
                                 {
                                     botAI->Say(response);
+                                    LOG_INFO("playerbots", "[OllamaChat] Bot {} dice: \"{}\"", botPtr->GetName(), response);
                                     ProcessBotChatMessage(botPtr, response, SRC_SAY_LOCAL, nullptr);
                                 }
                                 else if (g_DebugEnabled)
                                 {
-                                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} skipping Say reply - no one within {} yards to hear it", 
+                                    LOG_INFO("playerbots", "[Ollama Chat] Bot {} skipping Say reply - no one within {} yards to hear it",
                                             botPtr->GetName(), g_SayDistance);
                                 }
                             }
@@ -1599,15 +1873,16 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                                         }
                                     }
                                 }
-                                
+
                                 if (someoneCanHear)
                                 {
                                     botAI->Yell(response);
+                                    LOG_INFO("playerbots", "[OllamaChat] Bot {} grita: \"{}\"", botPtr->GetName(), response);
                                     ProcessBotChatMessage(botPtr, response, SRC_YELL_LOCAL, nullptr);
                                 }
                                 else if (g_DebugEnabled)
                                 {
-                                    LOG_INFO("server.loading", "[Ollama Chat] Bot {} skipping Yell reply - no one within {} yards to hear it", 
+                                    LOG_INFO("playerbots", "[Ollama Chat] Bot {} skipping Yell reply - no one within {} yards to hear it",
                                             botPtr->GetName(), g_YellDistance);
                                 }
                             }
@@ -1618,22 +1893,21 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                                 Player* originalSender = ObjectAccessor::FindPlayer(ObjectGuid(senderGuid));
                                 if (originalSender)
                                 {
-                                    if(g_DebugEnabled)
-                                    {
-                                        LOG_INFO("server.loading", "[Ollama Chat] Bot {} whispering response '{}' to {}", 
-                                                botPtr->GetName(), response, originalSender->GetName());
-                                    }
+                                    // Send first: any debug logging must never gate or delay delivery.
                                     botAI->Whisper(response, originalSender->GetName());
+                                    LOG_INFO("playerbots", "[OllamaChat] Bot {} responde (susurro) a {}: \"{}\"",
+                                            botPtr->GetName(), originalSender->GetName(), response);
                                     // Don't trigger ProcessBotChatMessage for whispers - they're private
                                 }
                                 else if(g_DebugEnabled)
                                 {
-                                    LOG_ERROR("server.loading", "[Ollama Chat] Cannot whisper response - original sender not found for GUID {}", senderGuid);
+                                    LOG_ERROR("playerbots", "[Ollama Chat] Cannot whisper response - original sender not found for GUID {}", senderGuid);
                                 }
                             }
                             break;
-                        default:              
+                        default:
                             botAI->Say(response);
+                            LOG_INFO("playerbots", "[OllamaChat] Bot {} dice: \"{}\"", botPtr->GetName(), response);
                             ProcessBotChatMessage(botPtr, response, SRC_SAY_LOCAL, nullptr);
                             break;
                     }
@@ -1648,25 +1922,22 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                     float respDistance = senderPtr->GetDistance(botPtr);
                     if(g_DebugEnabled)
                     {
-                        LOG_INFO("server.loading", "[Ollama Chat] Bot {} (distance: {}) responded: {}", botPtr->GetName(), respDistance, response);
+                        LOG_INFO("playerbots", "[Ollama Chat] Bot {} (distance: {}) responded: {}", botPtr->GetName(), respDistance, response);
                     }
                 }
                 else
                 {
                     if(g_DebugEnabled)
                     {
-                        LOG_INFO("server.loading", "[Ollama Chat] Bot {} responded: {} (distance not calculated - players not in world)", botPtr->GetName(), response);
+                        LOG_INFO("playerbots", "[Ollama Chat] Bot {} responded: {} (distance not calculated - players not in world)", botPtr->GetName(), response);
                     }
                 }
             }
             catch (const std::exception& ex)
             {
-                if(g_DebugEnabled)
-                {
-                    LOG_ERROR("server.loading", "[Ollama Chat] Exception in bot response thread: {}", ex.what());
-                }
+                LOG_ERROR("playerbots", "[OllamaChat] Exception in bot response thread: {}", ex.what());
             }
-        }).detach();
+        });
 
     }
 }
@@ -1676,14 +1947,14 @@ static bool IsBotEligibleForChatChannelLocal(Player* bot, Player* player, ChatCh
     if (!bot || !player || bot == player)
     {
         if (g_DebugEnabled)
-            LOG_INFO("server.loading", "[Ollama Chat] IsBotEligible: FAILED basic check - bot={}, player={}, same={}", 
+            LOG_INFO("playerbots", "[Ollama Chat] IsBotEligible: FAILED basic check - bot={}, player={}, same={}", 
                     (void*)bot, (void*)player, (bot == player));
         return false;
     }
     if (!PlayerbotsMgr::instance().GetPlayerbotAI(bot))
     {
         if (g_DebugEnabled)
-            LOG_INFO("server.loading", "[Ollama Chat] IsBotEligible: Bot {} FAILED - no PlayerbotAI", bot->GetName());
+            LOG_INFO("playerbots", "[Ollama Chat] IsBotEligible: Bot {} FAILED - no PlayerbotAI", bot->GetName());
         return false;
     }
         
@@ -1714,7 +1985,7 @@ static bool IsBotEligibleForChatChannelLocal(Player* bot, Player* player, ChatCh
         {
             if(g_DebugEnabled)
             {
-                LOG_ERROR("server.loading", "[Ollama Chat] IsBotEligibleForChatChannelLocal: Channel is null");
+                LOG_ERROR("playerbots", "[Ollama Chat] IsBotEligibleForChatChannelLocal: Channel is null");
             }
             return false;
         }
@@ -1730,7 +2001,7 @@ static bool IsBotEligibleForChatChannelLocal(Player* bot, Player* player, ChatCh
         {
             if(g_DebugEnabled)
             {
-                LOG_INFO("server.loading", "[Ollama Chat] IsBotEligibleForChatChannelLocal: Bot {} not in same channel instance '{}' - Bot team: {}, Channel ptr: {} vs {}", 
+                LOG_INFO("playerbots", "[Ollama Chat] IsBotEligibleForChatChannelLocal: Bot {} not in same channel instance '{}' - Bot team: {}, Channel ptr: {} vs {}", 
                         bot->GetName(), channel->GetName(), (int)bot->GetTeamId(),
                         (void*)candidateChannel, (void*)channel);
             }
@@ -1747,7 +2018,7 @@ static bool IsBotEligibleForChatChannelLocal(Player* bot, Player* player, ChatCh
             {
                 if(g_DebugEnabled)
                 {
-                    LOG_INFO("server.loading", "[Ollama Chat] IsBotEligibleForChatChannelLocal: Bot {} different faction from player - Bot: {}, Player: {}, Channel: '{}'", bot->GetName(), (int)bot->GetTeamId(), (int)player->GetTeamId(), channel->GetName());
+                    LOG_INFO("playerbots", "[Ollama Chat] IsBotEligibleForChatChannelLocal: Bot {} different faction from player - Bot: {}, Player: {}, Channel: '{}'", bot->GetName(), (int)bot->GetTeamId(), (int)player->GetTeamId(), channel->GetName());
                 }
                 return false;
             }
@@ -1797,8 +2068,8 @@ static bool IsBotEligibleForChatChannelLocal(Player* bot, Player* player, ChatCh
     }
 }
 
-std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* player)
-{  
+std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* player, ChatChannelSourceLocal sourceLocal)
+{
     if (!bot || !player) {
         return "";
     }
@@ -1811,7 +2082,7 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
         return "";
     }
     if (g_ChatPromptTemplate.empty()) {
-        LOG_ERROR("server.loading", "[Ollama Chat] GenerateBotPrompt: template is empty");
+        LOG_ERROR("playerbots", "[Ollama Chat] GenerateBotPrompt: template is empty");
         return "";
     }
 
@@ -1852,6 +2123,7 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
     float playerDistance            = player->IsInWorld() && bot->IsInWorld() ? player->GetDistance(bot) : -1.0f;
 
     std::string chatHistory         = GetBotHistoryPrompt(botGuid, playerGuid, playerMessage);
+    std::string channelHistory      = GetChannelHistoryPrompt(GetChannelHistoryKey(sourceLocal, bot));
     std::string sentimentInfo       = GetSentimentPromptAddition(bot, player);
 
     // Retrieve RAG information if enabled
@@ -1863,11 +2135,11 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
             ragInfo = SafeFormat(g_RAGPromptTemplate, fmt::arg("rag_info", ragContent));
         }
         if (g_DebugEnabled) {
-            LOG_INFO("server.loading", "[Ollama Chat] RAG Debug - Enabled: {}, System: {}, Message: '{}', Results: {}, Content length: {}",
+            LOG_INFO("playerbots", "[Ollama Chat] RAG Debug - Enabled: {}, System: {}, Message: '{}', Results: {}, Content length: {}",
                 g_EnableRAG, (void*)g_RAGSystem, playerMessage, ragResults.size(), ragContent.length());
         }
     } else if (g_DebugEnabled) {
-        LOG_INFO("server.loading", "[Ollama Chat] RAG Debug - Not enabled or no system - Enabled: {}, System: {}",
+        LOG_INFO("playerbots", "[Ollama Chat] RAG Debug - Not enabled or no system - Enabled: {}, System: {}",
             g_EnableRAG, (void*)g_RAGSystem);
     }
 
@@ -1906,6 +2178,7 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
         fmt::arg("player_message", playerMessage),
         fmt::arg("extra_info", extraInfo),
         fmt::arg("chat_history", chatHistory),
+        fmt::arg("channel_history", channelHistory),
         fmt::arg("sentiment_info", sentimentInfo)
     );
 
@@ -1921,7 +2194,7 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
 
     // Debug logging for full prompt including RAG information
     if (g_DebugEnabled && g_DebugShowFullPrompt) {
-        LOG_INFO("server.loading", "[Ollama Chat] Full prompt sent to bot {} for player {}: {}", botName, playerName, prompt);
+        LOG_INFO("playerbots", "[Ollama Chat] Full prompt sent to bot {} for player {}: {}", botName, playerName, prompt);
     }
 
     return prompt;
